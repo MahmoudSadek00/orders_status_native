@@ -122,8 +122,14 @@ NATIVE_EXPORT_DEFAULTS = {
 # unfulfilled, Cancelled at blank -- came out Pending, which was wrong. A 'refunded'
 # order that WAS fulfilled is a different situation entirely (shipped, then returned
 # after the fact) and is left alone -- not a cancellation, and likely already logged
-# elsewhere as shipped.
-REFUND_CANCEL_STATUSES = {'refunded'}
+# elsewhere as shipped. 'partially_refunded' gets the exact same treatment (per
+# Mahmoud, Aug 2026) -- same reasoning, same fulfillment_status guard: a
+# partially-refunded order that's still unfulfilled is treated as Cancelled too, but
+# one that's already fulfilled (shipped, then partially adjusted/returned) is left
+# alone. Note this is naturally safe either way for an order that HAS actually
+# shipped: filter_new drops it from the "new orders" list once it's found on a raw
+# sheet, regardless of what status got assigned here.
+REFUND_CANCEL_STATUSES = {'refunded', 'partially_refunded'}
 
 # Shopify's own 'Source' column (own channel field, NOT this tool's own 'Source' output
 # column) -- values seen in a real sample: 'pos' (in-store, sold and paid on the spot --
