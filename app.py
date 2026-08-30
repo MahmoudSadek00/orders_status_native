@@ -92,11 +92,12 @@ if shopify_file is not None:
     st.write(f"{len(shopify_df)} rows loaded.")
 
     guessed = default_mapping(shopify_df.columns.tolist(), NATIVE_EXPORT_DEFAULTS)
-    fields_needed = ['ref_number', 'order_date', 'order_value', 'country', 'city', 'cancelled_at']
+    fields_needed = ['ref_number', 'order_date', 'order_value', 'country', 'city', 'cancelled_at', 'source']
     labels = {
         'ref_number': 'Reference / Order Number ("Name")', 'order_date': 'Order date ("Created at")',
         'order_value': 'Order value, excl. shipping ("Subtotal")', 'country': 'Shipping country',
         'city': 'Shipping city', 'cancelled_at': 'Cancelled-at column (non-blank = cancelled)',
+        'source': 'Sales channel ("Source") -- excludes POS/in-store orders',
     }
     mapping = {}
     cols = st.columns(3)
@@ -109,6 +110,11 @@ if shopify_file is not None:
             mapping[field] = None if choice == '(none)' else choice
     if not mapping.get('cancelled_at'):
         st.caption("No Cancelled-at column mapped -- every new order here will be added as Pending.")
+    if not mapping.get('source'):
+        st.warning(
+            "No Source column mapped -- POS/in-store orders won't be excluded, which "
+            "will inflate the count (they're sold and paid on the spot, never shipped)."
+        )
 
     ready = bool(mapping.get('ref_number'))
     if not ready:
@@ -138,13 +144,14 @@ if shopify_file is not None:
         n_pending = len(new_rows) - n_canceled
 
         st.success(
-            f"{stats['orders_total']} distinct order(s) in this export. "
-            f"{len(rows) - len(new_rows)} already logged somewhere (a raw sheet, the "
-            f"staging sheet, or a previous run of this tool) -- skipped, never "
-            f"duplicated. **{len(new_rows)} NEW order(s) to add**: {n_canceled} "
-            f"Cancelled, {n_pending} Pending. {stats['blank_country_count']} had no "
-            f"Shipping country on file (POS/Draft order, expected -- defaulted, not "
-            f"flagged)."
+            f"{stats['orders_total']} distinct order(s) in this export "
+            f"({stats['pos_excluded_count']} POS/in-store order(s) excluded -- never "
+            f"shipped, so never tracked here). {len(rows) - len(new_rows)} already "
+            f"logged somewhere (a raw sheet, the staging sheet, or a previous run of "
+            f"this tool) -- skipped, never duplicated. **{len(new_rows)} NEW order(s) "
+            f"to add**: {n_canceled} Cancelled, {n_pending} Pending. "
+            f"{stats['blank_country_count']} had no Shipping country on file despite "
+            f"not being POS (Draft order, expected -- defaulted, not flagged)."
         )
 
         review = [r for r in new_rows if r['needs_review']]
