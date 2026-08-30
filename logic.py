@@ -46,6 +46,7 @@ fresher numbers.
 """
 import io
 import re
+import time
 import unicodedata
 import datetime as dt
 
@@ -195,19 +196,49 @@ def get_client(service_account_info):
     return gspread.authorize(creds)
 
 
+def _call_with_retry(fn, max_retries=4):
+    """Runs fn() with short exponential backoff on transient Google API errors (429 rate
+    limit, or a 5xx like the 503 'service currently unavailable' Mahmoud hit on a large
+    real file, Aug 2026) -- a real, if uncommon, Sheets API hiccup, not a config problem.
+    Anything else (403 permission denied, 404 not found, ...) is NOT transient and is
+    raised immediately -- retrying it would just waste time on an error retrying can't
+    fix."""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except gspread.exceptions.APIError as e:
+            status = None
+            resp = getattr(e, 'response', None)
+            if resp is not None:
+                status = getattr(resp, 'status_code', None)
+            if status not in (429, 500, 502, 503, 504):
+                raise
+            last_err = e
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s
+    raise last_err
+
+
 def _col_keys(ws, ref_col_name):
-    """clean_key() of every non-blank value under ref_col_name in worksheet ws."""
-    values = ws.get_values()
-    if not values:
+    """clean_key() of every non-blank value under ref_col_name in worksheet ws.
+
+    Reads only the header row plus that ONE column -- not the whole sheet -- on purpose:
+    an earlier version called ws.get_values() (the full sheet, every column) just to
+    pull one column out of it, which on a large real sheet (Mahmoud's real merged file
+    triggered this, Aug 2026 -- hundreds of thousands of source rows) is enough data to
+    occasionally trip a 503 from Google's own API. Fetching only what's actually needed
+    is both faster and far less likely to hit that limit; _call_with_retry above still
+    covers the cases where it happens anyway."""
+    header = _call_with_retry(lambda: ws.row_values(1))
+    if not header or ref_col_name not in header:
         return set()
-    header = values[0]
-    if ref_col_name not in header:
-        return set()
-    idx = header.index(ref_col_name)
+    idx = header.index(ref_col_name)  # 0-based position in the header row
+    col_values = _call_with_retry(lambda: ws.col_values(idx + 1))  # gspread columns are 1-indexed
     out = set()
-    for row in values[1:]:
-        if idx < len(row) and row[idx]:
-            k = clean_key(row[idx])
+    for v in col_values[1:]:  # skip the header cell itself
+        if v:
+            k = clean_key(v)
             if k:
                 out.add(k)
     return out
@@ -220,15 +251,15 @@ def read_existing_keys(gc, staging_spreadsheet_id):
     keys = set()
     counts = {}
     for gkey, cfg in RAW_SHEETS.items():
-        sh = gc.open_by_key(cfg['sheet_id'])
-        ws = sh.worksheet(cfg['tab'])
+        sh = _call_with_retry(lambda cfg=cfg: gc.open_by_key(cfg['sheet_id']))
+        ws = _call_with_retry(lambda sh=sh, cfg=cfg: sh.worksheet(cfg['tab']))
         k = _col_keys(ws, cfg['ref_col'])
         counts[f'raw:{gkey}'] = len(k)
         keys |= k
 
-    staging_sh = gc.open_by_key(staging_spreadsheet_id)
+    staging_sh = _call_with_retry(lambda: gc.open_by_key(staging_spreadsheet_id))
     try:
-        orders_ws = staging_sh.worksheet(ORDERS_TAB)
+        orders_ws = _call_with_retry(lambda: staging_sh.worksheet(ORDERS_TAB))
     except gspread.WorksheetNotFound:
         raise RuntimeError(
             f"The staging sheet has no '{ORDERS_TAB}' tab yet -- run the main daily sync "
@@ -366,12 +397,13 @@ def rows_to_excel_bytes(rows):
 
 def append_to_staging(gc, staging_spreadsheet_id, rows):
     """Appends the given rows at the bottom of the live staging Orders tab. Returns the
-    number of rows appended."""
+    number of rows appended. Same retry wrapping as read_existing_keys/_col_keys, so a
+    transient 429/5xx here (e.g. right after a big read) doesn't fail the whole add."""
     if not rows:
         return 0
-    staging_sh = gc.open_by_key(staging_spreadsheet_id)
-    orders_ws = staging_sh.worksheet(ORDERS_TAB)
+    staging_sh = _call_with_retry(lambda: gc.open_by_key(staging_spreadsheet_id))
+    orders_ws = _call_with_retry(lambda: staging_sh.worksheet(ORDERS_TAB))
     now_str = dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
     values = [row_to_values(r, now_str) for r in rows]
-    orders_ws.append_rows(values)
+    _call_with_retry(lambda: orders_ws.append_rows(values))
     return len(values)
