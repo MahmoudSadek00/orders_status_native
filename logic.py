@@ -30,9 +30,12 @@ tools use). Confirmed against a real sample file, Aug 2026:
    ('2026-03-10 12:29:49 +0400') -- no day-first/month-first guessing needed.
 
 5. Country comes as a real ISO code ('AE' / 'OM'), normalized here to the raw sheets'
-   own convention ('UAE' / 'OM'). Blank for POS/Draft orders (~57% in the sample --
-   expected, not a data problem, same pattern seen in every other Shopify export format
-   used across this whole project).
+   own convention ('UAE' / 'OM'). Blank for POS orders (~57% of orders in the sample --
+   in-store, rung up and paid on the spot). POS orders are EXCLUDED outright via the
+   'Source' column (Aug 2026, per Mahmoud) -- they never touch the shipping company, so
+   they don't belong in an "orders still waiting on the shipping company" tracker at
+   all. Confirmed against the real sample: every blank-Shipping-Country row was a POS
+   row and vice versa, 1:1.
 
 Why this app exists at all: the 3 raw order-tracking Google Sheets only ever get a row
 once an order is physically WITH the shipping company -- the ops team's own workflow,
@@ -94,7 +97,18 @@ NATIVE_EXPORT_DEFAULTS = {
     'country': ['Shipping Country'],
     'city': ['Shipping City'],
     'cancelled_at': ['Cancelled at'],
+    'source': ['Source'],
 }
+
+# Shopify's own 'Source' column (own channel field, NOT this tool's own 'Source' output
+# column) -- values seen in a real sample: 'pos' (in-store, sold and paid on the spot --
+# never touches the shipping company, so it should never enter this "orders waiting on
+# the shipping company" tracker at all), 'web', 'shopify_draft_order', and numeric
+# third-party-app channel IDs. Confirmed against the real sample (Aug 2026, per Mahmoud):
+# every single blank-Shipping-Country row was a 'pos' row and vice versa -- so excluding
+# 'pos' here also naturally clears out the "blank country defaulted" noise from the
+# count, not just double-counted in-store sales.
+EXCLUDED_SOURCES = {'pos'}
 
 # Shopify's own 'Shipping country' field comes as a bare ISO code in this format ('AE'),
 # unlike the analytics-report formats' full names ('United Arab Emirates') -- both
@@ -288,6 +302,7 @@ def classify_native_export_orders(shopify_df, target_key, mapping):
     country_col = mapping.get('country')
     city_col = mapping.get('city')
     cancelled_col = mapping.get('cancelled_at')
+    source_col = mapping.get('source')
 
     work = shopify_df.copy()
     work = work[work[ref_col].astype(str).str.strip() != '']
@@ -297,6 +312,17 @@ def classify_native_export_orders(shopify_df, target_key, mapping):
         work = work[work[value_col].astype(str).str.strip() != '']
     work['_key'] = work[ref_col].map(clean_key)
     work = work[work['_key'] != '']
+
+    pos_excluded_count = 0
+    if source_col and source_col in work.columns:
+        # POS orders are rung up and paid in-store on the spot -- they never go through
+        # the shipping company, so they don't belong in an "orders still waiting on the
+        # shipping company" tracker at all (per Mahmoud, Aug 2026). Excluded outright
+        # here rather than kept-and-flagged, since keeping them was inflating the "new
+        # orders" count with orders that were never meant to be tracked here.
+        is_pos = work[source_col].astype(str).str.strip().str.lower().isin(EXCLUDED_SOURCES)
+        pos_excluded_count = int(is_pos.sum())
+        work = work[~is_pos]
 
     default_country = ORDER_STATUS_GROUPS[target_key]['default_country']
     source_label = f"Shopify (unshipped) - {RAW_SHEETS[target_key]['label']}"
@@ -353,7 +379,11 @@ def classify_native_export_orders(shopify_df, target_key, mapping):
             ),
         })
 
-    stats = {'orders_total': len(rows), 'blank_country_count': blank_country_count}
+    stats = {
+        'orders_total': len(rows),
+        'blank_country_count': blank_country_count,
+        'pos_excluded_count': pos_excluded_count,
+    }
     return rows, stats
 
 
