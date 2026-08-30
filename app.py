@@ -97,12 +97,17 @@ if shopify_file is not None:
     st.write(f"{len(shopify_df)} rows loaded.")
 
     guessed = default_mapping(shopify_df.columns.tolist(), NATIVE_EXPORT_DEFAULTS)
-    fields_needed = ['ref_number', 'order_date', 'order_value', 'country', 'city', 'cancelled_at', 'source']
+    fields_needed = [
+        'ref_number', 'order_date', 'order_value', 'country', 'city', 'cancelled_at',
+        'source', 'financial_status', 'fulfillment_status',
+    ]
     labels = {
         'ref_number': 'Reference / Order Number ("Name")', 'order_date': 'Order date ("Created at")',
         'order_value': 'Order value, excl. shipping ("Subtotal")', 'country': 'Shipping country',
         'city': 'Shipping city', 'cancelled_at': 'Cancelled-at column (non-blank = cancelled)',
         'source': 'Sales channel ("Source") -- excludes POS/in-store orders',
+        'financial_status': 'Financial status (catches refunded-before-shipped as Cancelled too)',
+        'fulfillment_status': 'Fulfillment status (used with Financial status above)',
     }
     mapping = {}
     cols = st.columns(3)
@@ -119,6 +124,11 @@ if shopify_file is not None:
         st.warning(
             "No Source column mapped -- POS/in-store orders won't be excluded, which "
             "will inflate the count (they're sold and paid on the spot, never shipped)."
+        )
+    if not mapping.get('financial_status'):
+        st.caption(
+            "No Financial status column mapped -- a refunded-before-it-ever-shipped "
+            "order won't be caught as Cancelled unless Cancelled-at is also set."
         )
 
     ready = bool(mapping.get('ref_number'))
