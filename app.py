@@ -1,12 +1,14 @@
 import json
 import datetime as dt
 
+import pandas as pd
 import streamlit as st
 
 from logic import (
     RAW_SHEETS, ORDER_STATUS_GROUPS, NATIVE_EXPORT_DEFAULTS, STAGING_SPREADSHEET_ID_DEFAULT,
-    get_client, read_existing_keys, classify_native_export_orders, filter_new,
-    rows_to_dataframe, rows_to_excel_bytes, append_to_staging, read_any, default_mapping,
+    NOT_SHIPPED_TAB, get_client, read_existing_keys, read_not_shipped_rows,
+    find_stale_not_shipped, classify_native_export_orders, filter_new, rows_to_dataframe,
+    rows_to_excel_bytes, append_to_staging, read_any, default_mapping,
 )
 
 st.set_page_config(page_title="Orders Status Check (Native Export)", layout="wide")
@@ -18,9 +20,12 @@ st.caption(
     "file's own Subtotal (goods only, shipping already excluded -- no subtraction "
     "needed). Upload a full export (every status, not just shipped) for ONE country "
     "group. This checks every order against the 3 raw tracking sheets AND the staging "
-    "\"Orders\" tab that already feeds the Dashboard, and shows only the orders that "
-    "aren't logged anywhere yet -- so Cancelled orders and orders still awaiting "
-    "shipment finally get counted, without ever duplicating a row that's already there. "
+    f"Orders + \"{NOT_SHIPPED_TAB}\" tabs, and shows only the orders that aren't logged "
+    "anywhere yet -- so Cancelled orders and orders still awaiting shipment finally get "
+    f"counted, without ever duplicating a row that's already there. New orders get "
+    f"added to the \"{NOT_SHIPPED_TAB}\" tab (not straight into Orders), and every run "
+    f"also flags anything sitting in \"{NOT_SHIPPED_TAB}\" that has since actually shown "
+    "up on a raw sheet -- meaning the team shipped it for real after it was logged here. "
     "The 3 raw sheets themselves are never touched -- read-only."
 )
 
@@ -125,8 +130,8 @@ if shopify_file is not None:
     st.header("3. Check & add")
     if st.button("Check against the raw sheets + staging", disabled=not ready, type="primary"):
         try:
-            with st.spinner("Reading the 3 raw sheets and the staging Orders tab..."):
-                existing_keys, counts = read_existing_keys(gc, staging_id)
+            with st.spinner("Reading the 3 raw sheets and the staging Orders + Not Shipped tabs..."):
+                existing_keys, raw_keys, counts = read_existing_keys(gc, staging_id)
         except Exception as e:
             st.error(f"Couldn't read the sheets: {e}")
             st.stop()
@@ -134,9 +139,28 @@ if shopify_file is not None:
         st.caption(
             f"Already logged -- UAE & Oman: {counts.get('raw:uae_om', 0)}, "
             f"Gulf: {counts.get('raw:gulf', 0)}, Iraq: {counts.get('raw:iraq', 0)} "
-            f"(raw sheets), {counts.get('staging', 0)} row(s) in the staging Orders tab "
-            f"-- {len(existing_keys)} unique order(s) total once de-duplicated."
+            f"(raw sheets), {counts.get('staging_orders', 0)} row(s) in the staging "
+            f"Orders tab, {counts.get('not_shipped', 0)} row(s) in "
+            f"\"{NOT_SHIPPED_TAB}\" -- {len(existing_keys)} unique order(s) total once "
+            f"de-duplicated."
         )
+
+        try:
+            with st.spinner(f"Checking \"{NOT_SHIPPED_TAB}\" for orders the team has since shipped..."):
+                not_shipped_rows = read_not_shipped_rows(gc, staging_id)
+                stale = find_stale_not_shipped(not_shipped_rows, raw_keys)
+        except Exception as e:
+            stale = []
+            st.warning(f"Couldn't run the staleness check on \"{NOT_SHIPPED_TAB}\": {e}")
+
+        if stale:
+            with st.expander(
+                f"⚠️ {len(stale)} order(s) in \"{NOT_SHIPPED_TAB}\" have since "
+                f"shown up on a raw sheet -- the team shipped them for real, remove/"
+                f"update them in \"{NOT_SHIPPED_TAB}\"",
+                expanded=True,
+            ):
+                st.dataframe(pd.DataFrame(stale), use_container_width=True)
 
         rows, stats = classify_native_export_orders(shopify_df, target_key, mapping)
         new_rows = filter_new(rows, existing_keys)
@@ -179,16 +203,17 @@ if shopify_file is not None:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
             with c2:
-                if st.button(f"Add these {len(new_rows)} row(s) to the staging Orders tab", type="primary"):
+                if st.button(f"Add these {len(new_rows)} row(s) to \"{NOT_SHIPPED_TAB}\"", type="primary"):
                     try:
-                        with st.spinner("Appending to the staging sheet..."):
+                        with st.spinner(f"Appending to \"{NOT_SHIPPED_TAB}\"..."):
                             n = append_to_staging(gc, staging_id, new_rows)
                         st.success(
-                            f"{n} row(s) appended to the staging Orders tab. The Dashboard "
-                            f"will pick them up on its next refresh."
+                            f"{n} row(s) appended to \"{NOT_SHIPPED_TAB}\". Re-run this "
+                            f"check any time to catch any of them that the team has "
+                            f"since actually shipped (see the staleness warning above)."
                         )
                         st.session_state.pop('new_rows', None)
                     except Exception as e:
-                        st.error(f"Couldn't append to the staging sheet: {e}")
+                        st.error(f"Couldn't append to \"{NOT_SHIPPED_TAB}\": {e}")
         else:
             st.info("Nothing new -- every order in this export is already logged somewhere.")
