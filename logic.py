@@ -21,10 +21,15 @@ tools use). Confirmed against a real sample file, Aug 2026:
    nominal/list rate either way) -- so Subtotal itself is unaffected and always means
    goods value, shipping excluded, already net of any per-order discount.
 
-3. Cancelled orders: 'Cancelled at' (a real timestamp) is the complete signal -- non-
-   blank for every genuinely cancelled order. Financial Status ('voided') alone missed
-   21 of 169 real cancelled orders in the sample file (some cancelled orders carry some
-   OTHER Financial Status, mostly 'pending').
+3. Cancelled orders: 'Cancelled at' (a real timestamp) being non-blank is the primary
+   signal -- Financial Status ('voided') alone missed 21 of 169 real cancelled orders in
+   the sample file (some cancelled orders carry some OTHER Financial Status, mostly
+   'pending'). PLUS (Aug 2026, per Mahmoud, real production case: order #91780):
+   Financial Status 'refunded' while Fulfillment Status ISN'T 'fulfilled' also counts as
+   Cancelled -- money back before the order ever shipped, a real cancellation even
+   though nobody clicked Shopify's own "Cancel order" button. A 'refunded' order that
+   WAS fulfilled is left alone (shipped, then returned -- not a cancellation). See
+   REFUND_CANCEL_STATUSES.
 
 4. 'Created at' already comes as an unambiguous ISO datetime with a timezone offset
    ('2026-03-10 12:29:49 +0400') -- no day-first/month-first guessing needed.
@@ -106,7 +111,19 @@ NATIVE_EXPORT_DEFAULTS = {
     'city': ['Shipping City'],
     'cancelled_at': ['Cancelled at'],
     'source': ['Source'],
+    'financial_status': ['Financial Status'],
+    'fulfillment_status': ['Fulfillment Status'],
 }
+
+# A 'refunded' order whose Fulfillment Status ISN'T 'fulfilled' means the money went
+# back to the customer without the order ever shipping -- functionally a cancellation,
+# even though nobody clicked Shopify's own "Cancel order" button (which is what sets
+# Cancelled at). Confirmed real case, Aug 2026 (order #91780, per Mahmoud): refunded +
+# unfulfilled, Cancelled at blank -- came out Pending, which was wrong. A 'refunded'
+# order that WAS fulfilled is a different situation entirely (shipped, then returned
+# after the fact) and is left alone -- not a cancellation, and likely already logged
+# elsewhere as shipped.
+REFUND_CANCEL_STATUSES = {'refunded'}
 
 # Shopify's own 'Source' column (own channel field, NOT this tool's own 'Source' output
 # column) -- values seen in a real sample: 'pos' (in-store, sold and paid on the spot --
@@ -341,12 +358,16 @@ def find_stale_not_shipped(not_shipped_rows, raw_keys):
 
 def classify_native_export_orders(shopify_df, target_key, mapping):
     """mapping: dict with keys ref_number / order_date / order_value / country / city /
-    cancelled_at -- see NATIVE_EXPORT_DEFAULTS. order_value ('Subtotal') is populated
-    only on each order's first row and blank on later line-item rows for the same order
-    -- filtering to non-blank order_value both selects the first row per order and needs
-    no sum across rows (see module docstring). order_value itself already excludes
-    shipping, no derivation needed. cancelled_at is checked for non-blank, not a
-    TRUE/1/YES flag (it's a real timestamp column, e.g. 'Cancelled at').
+    cancelled_at / source / financial_status / fulfillment_status -- see
+    NATIVE_EXPORT_DEFAULTS. order_value ('Subtotal') is populated only on each order's
+    first row and blank on later line-item rows for the same order -- filtering to
+    non-blank order_value both selects the first row per order and needs no sum across
+    rows (see module docstring). order_value itself already excludes shipping, no
+    derivation needed. An order counts as Cancelled if EITHER cancelled_at is non-blank
+    (a real timestamp, not a TRUE/1/YES flag), OR financial_status is 'refunded' while
+    fulfillment_status isn't 'fulfilled' -- money back before it ever shipped, which is
+    a cancellation in every way that matters even if nobody clicked Shopify's own
+    "Cancel order" button (see REFUND_CANCEL_STATUSES).
 
     Returns (rows, stats)."""
     ref_col = mapping.get('ref_number')
@@ -356,6 +377,8 @@ def classify_native_export_orders(shopify_df, target_key, mapping):
     city_col = mapping.get('city')
     cancelled_col = mapping.get('cancelled_at')
     source_col = mapping.get('source')
+    financial_status_col = mapping.get('financial_status')
+    fulfillment_status_col = mapping.get('fulfillment_status')
 
     work = shopify_df.copy()
     work = work[work[ref_col].astype(str).str.strip() != '']
@@ -405,6 +428,15 @@ def classify_native_export_orders(shopify_df, target_key, mapping):
             blank_country_count += 1
 
         is_cancelled = bool(str(r.get(cancelled_col, '')).strip()) if cancelled_col else False
+        if not is_cancelled and financial_status_col:
+            fin_status = str(r.get(financial_status_col, '')).strip().lower()
+            if fin_status in REFUND_CANCEL_STATUSES:
+                fulfil_status = (
+                    str(r.get(fulfillment_status_col, '')).strip().lower()
+                    if fulfillment_status_col else ''
+                )
+                if fulfil_status != 'fulfilled':
+                    is_cancelled = True
 
         rows.append({
             'key': r['_key'],
