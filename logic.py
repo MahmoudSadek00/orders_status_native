@@ -74,6 +74,14 @@ RAW_SHEETS = {
 
 ORDERS_TAB = 'Orders'
 
+# Mahmoud's own new holding tab (Aug 2026) in the SAME staging spreadsheet as ORDERS_TAB
+# -- he created it by hand. New Cancelled/Pending orders from this app now get appended
+# here instead of straight into ORDERS_TAB, so he can review them separately from what
+# the daily sync / other tools write. Still checked for de-duplication just like
+# ORDERS_TAB (see read_existing_keys) and still cross-checked against the 3 raw sheets
+# for staleness (see find_stale_not_shipped) -- same header row as ORDERS_HEADER below.
+NOT_SHIPPED_TAB = 'Not Shipped'
+
 # Mahmoud's real staging sheet (confirmed, Aug 2026: docs.google.com/spreadsheets/d/
 # 1dZMqtqvnxe6GspH0C10AvXECB74NP-ZjDG_BihMOkmg -- "Orders" tab). Baked in as a default
 # so the only secret still needed is the service-account credential -- app.py's
@@ -259,10 +267,16 @@ def _col_keys(ws, ref_col_name):
 
 
 def read_existing_keys(gc, staging_spreadsheet_id):
-    """Reads the 3 raw sheets AND the staging Orders tab live. Returns
-    (keys, counts) -- keys: the union of every already-logged order's clean_key()
-    across all 4 places; counts: per-source row counts for the on-screen caption."""
+    """Reads the 3 raw sheets, the staging Orders tab, AND the staging Not Shipped tab,
+    all live. Returns (keys, raw_keys, counts):
+      - keys: the union of every already-logged order's clean_key() across all 5 places
+        -- used to decide which uploaded orders are actually new (filter_new).
+      - raw_keys: the union across ONLY the 3 raw sheets (not the 2 staging tabs) --
+        used separately by find_stale_not_shipped to catch an order that was added to
+        Not Shipped earlier and has SINCE shown up on a raw sheet for real.
+      - counts: per-source row counts for the on-screen caption."""
     keys = set()
+    raw_keys = set()
     counts = {}
     for gkey, cfg in RAW_SHEETS.items():
         sh = _call_with_retry(lambda cfg=cfg: gc.open_by_key(cfg['sheet_id']))
@@ -270,20 +284,59 @@ def read_existing_keys(gc, staging_spreadsheet_id):
         k = _col_keys(ws, cfg['ref_col'])
         counts[f'raw:{gkey}'] = len(k)
         keys |= k
+        raw_keys |= k
 
     staging_sh = _call_with_retry(lambda: gc.open_by_key(staging_spreadsheet_id))
+
     try:
         orders_ws = _call_with_retry(lambda: staging_sh.worksheet(ORDERS_TAB))
+        k = _col_keys(orders_ws, 'Reference Number')
+        counts['staging_orders'] = len(k)
+        keys |= k
+    except gspread.WorksheetNotFound:
+        # Not fatal on its own -- Not Shipped is the tab this app actually writes to now
+        # (see append_to_staging) -- but the Orders tab is still expected to exist since
+        # the daily sync / other Orders Status Check app write into it.
+        counts['staging_orders'] = 0
+
+    try:
+        not_shipped_ws = _call_with_retry(lambda: staging_sh.worksheet(NOT_SHIPPED_TAB))
+        k = _col_keys(not_shipped_ws, 'Reference Number')
+        counts['not_shipped'] = len(k)
+        keys |= k
     except gspread.WorksheetNotFound:
         raise RuntimeError(
-            f"The staging sheet has no '{ORDERS_TAB}' tab yet -- run the main daily sync "
-            f"(sync_orders.py, in the orders-sync project) at least once first, or create "
-            f"the tab by hand with the right header row."
+            f"The staging sheet has no '{NOT_SHIPPED_TAB}' tab yet -- create it by hand "
+            f"first (same header row as the Orders tab works fine, or leave it "
+            f"completely empty and this app will add the header itself on the first add)."
         )
-    k = _col_keys(orders_ws, 'Reference Number')
-    counts['staging'] = len(k)
-    keys |= k
-    return keys, counts
+    return keys, raw_keys, counts
+
+
+def read_not_shipped_rows(gc, staging_spreadsheet_id):
+    """Full rows (as dicts, keyed by header) currently sitting in the staging
+    'Not Shipped' tab. A full read here is fine -- unlike the 3 raw sheets, this tab
+    only ever holds what Mahmoud has manually added through this app, so it stays small.
+    Used only by find_stale_not_shipped."""
+    staging_sh = _call_with_retry(lambda: gc.open_by_key(staging_spreadsheet_id))
+    ws = _call_with_retry(lambda: staging_sh.worksheet(NOT_SHIPPED_TAB))
+    return _call_with_retry(lambda: ws.get_all_records())
+
+
+def find_stale_not_shipped(not_shipped_rows, raw_keys):
+    """Orders sitting in the Not Shipped tab (added there earlier as Cancelled/Pending)
+    that have SINCE shown up on one of the 3 raw tracking sheets -- meaning the ops team
+    actually shipped the order for real after Mahmoud logged it as not-shipped. Flags
+    these so he can go remove/update them in Not Shipped, instead of leaving a
+    contradictory status sitting there (counted Cancelled/Pending here, but the team
+    already shipped it)."""
+    stale = []
+    for row in not_shipped_rows:
+        ref = row.get('Reference Number', '')
+        key = clean_key(ref)
+        if key and key in raw_keys:
+            stale.append(row)
+    return stale
 
 
 def classify_native_export_orders(shopify_df, target_key, mapping):
@@ -426,14 +479,23 @@ def rows_to_excel_bytes(rows):
 
 
 def append_to_staging(gc, staging_spreadsheet_id, rows):
-    """Appends the given rows at the bottom of the live staging Orders tab. Returns the
-    number of rows appended. Same retry wrapping as read_existing_keys/_col_keys, so a
-    transient 429/5xx here (e.g. right after a big read) doesn't fail the whole add."""
+    """Appends the given rows at the bottom of the live staging Not Shipped tab (Aug
+    2026, per Mahmoud -- this app writes here now, not straight into Orders, so he can
+    review this holding list separately). Returns the number of rows appended. Same
+    retry wrapping as read_existing_keys/_col_keys, so a transient 429/5xx here (e.g.
+    right after a big read) doesn't fail the whole add."""
     if not rows:
         return 0
     staging_sh = _call_with_retry(lambda: gc.open_by_key(staging_spreadsheet_id))
-    orders_ws = _call_with_retry(lambda: staging_sh.worksheet(ORDERS_TAB))
+    ws = _call_with_retry(lambda: staging_sh.worksheet(NOT_SHIPPED_TAB))
+
+    # If Mahmoud just created the tab by hand and it's still completely empty, seed the
+    # header row first so the appended rows don't land as if they were the header.
+    existing_header = _call_with_retry(lambda: ws.row_values(1))
+    if not existing_header:
+        _call_with_retry(lambda: ws.append_row(ORDERS_HEADER))
+
     now_str = dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
     values = [row_to_values(r, now_str) for r in rows]
-    _call_with_retry(lambda: orders_ws.append_rows(values))
+    _call_with_retry(lambda: ws.append_rows(values))
     return len(values)
