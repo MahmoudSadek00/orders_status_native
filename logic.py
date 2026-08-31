@@ -56,6 +56,7 @@ import io
 import re
 import time
 import unicodedata
+import zipfile
 import datetime as dt
 
 import pandas as pd
@@ -202,11 +203,75 @@ def fix_mojibake(s):
         return s
 
 
+SUPPORTED_EXTS = ('.csv', '.xlsx', '.xls')
+
+
+def _read_bytes(name: str, data: bytes) -> pd.DataFrame:
+    buf = io.BytesIO(data)
+    if name.lower().endswith('.csv'):
+        return pd.read_csv(buf, dtype=str, keep_default_na=False)
+    return pd.read_excel(buf, dtype=str, keep_default_na=False)
+
+
 def read_any(file) -> pd.DataFrame:
-    name = getattr(file, 'name', str(file)).lower()
-    if name.endswith('.csv'):
-        return pd.read_csv(file, dtype=str, keep_default_na=False)
-    return pd.read_excel(file, dtype=str, keep_default_na=False)
+    name = getattr(file, 'name', str(file))
+    data = file.getvalue() if hasattr(file, 'getvalue') else file.read()
+    return _read_bytes(name, data)
+
+
+def read_many(files):
+    """Reads any mix of uploaded csv/xlsx/xls files AND .zip files in one go (Aug 2026,
+    per Mahmoud -- Shopify splits a big "Export orders" run into several
+    orders_export_N.zip download links, all in ONE email, and across the Gulf country
+    groups these pile up into dozens of downloaded zips/folders). Each zip can itself
+    contain any number of csv/xlsx/xls files nested at any folder depth -- every part
+    just gets dragged onto the uploader together, zipped or already-extracted, no manual
+    unzip/re-foldering needed first.
+
+    Returns (combined_df, stats) where stats has 'files_read' (source file names actually
+    parsed, zip entries shown as "zipname -> entry path") and 'files_skipped'
+    ((name, reason) pairs for anything that wasn't a recognized data file, e.g. a stray
+    __MACOSX entry or a non-data attachment that slipped into the selection)."""
+    frames = []
+    files_read = []
+    files_skipped = []
+    for f in files:
+        name = getattr(f, 'name', str(f))
+        data = f.getvalue() if hasattr(f, 'getvalue') else f.read()
+        lower = name.lower()
+        if lower.endswith('.zip'):
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    for info in zf.infolist():
+                        entry_name = info.filename
+                        base = entry_name.rsplit('/', 1)[-1]
+                        if info.is_dir() or not base or base.startswith('.') or '__MACOSX' in entry_name:
+                            continue
+                        if not base.lower().endswith(SUPPORTED_EXTS):
+                            files_skipped.append((f"{name} -> {entry_name}", "not a csv/xlsx/xls file"))
+                            continue
+                        try:
+                            with zf.open(info) as zf_entry:
+                                frames.append(_read_bytes(base, zf_entry.read()))
+                            files_read.append(f"{name} -> {entry_name}")
+                        except Exception as e:
+                            files_skipped.append((f"{name} -> {entry_name}", str(e)))
+            except Exception as e:
+                files_skipped.append((name, f"couldn't open as a zip: {e}"))
+        elif lower.endswith(SUPPORTED_EXTS):
+            try:
+                frames.append(_read_bytes(name, data))
+                files_read.append(name)
+            except Exception as e:
+                files_skipped.append((name, str(e)))
+        else:
+            files_skipped.append((name, "unsupported file type"))
+
+    stats = {'files_read': files_read, 'files_skipped': files_skipped}
+    if not frames:
+        return pd.DataFrame(), stats
+    combined = pd.concat(frames, ignore_index=True, sort=False).fillna('')
+    return combined, stats
 
 
 def guess_column(columns, candidates):
