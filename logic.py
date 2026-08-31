@@ -154,6 +154,14 @@ SHOPIFY_COUNTRY_MAP = {
     'iraq': 'IQ', 'iq': 'IQ',
 }
 
+# Countries GC doesn't actually serve at all, in any group (Aug 2026, per Mahmoud --
+# Bahrain isn't a market here). Before this, a Bahrain shipping address just fell through
+# to "unrecognized" and got silently defaulted into the group's default country (e.g.
+# counted as Saudi under the Gulf group) with a needs-review flag -- technically visible,
+# but still added to the sheet as if it belonged there. Skipped outright now instead of
+# defaulted+flagged.
+EXCLUDED_COUNTRY_NAMES = {'bahrain', 'bh'}
+
 ORDERS_HEADER = [
     'Source', 'Reference Number', 'Shipping Date', 'Order Date', 'Country', 'City',
     'Order Value', 'Status', 'New Customer Orders', 'Returning Customer Orders',
@@ -530,7 +538,14 @@ def classify_native_export_orders(shopify_df, target_key, mapping):
     source_label = f"Shopify (unshipped) - {RAW_SHEETS[target_key]['label']}"
     rows = []
     blank_country_count = 0
+    excluded_country_count = 0
     for _, r in work.iterrows():
+        if country_col:
+            country_raw_check = clean_display(r.get(country_col, '')).strip().lower()
+            if country_raw_check in EXCLUDED_COUNTRY_NAMES:
+                excluded_country_count += 1
+                continue
+
         order_date = None
         if date_col:
             raw_date = r.get(date_col)
@@ -594,6 +609,7 @@ def classify_native_export_orders(shopify_df, target_key, mapping):
         'orders_total': len(rows),
         'blank_country_count': blank_country_count,
         'pos_excluded_count': pos_excluded_count,
+        'excluded_country_count': excluded_country_count,
     }
     return rows, stats
 
