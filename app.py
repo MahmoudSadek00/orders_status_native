@@ -8,7 +8,7 @@ from logic import (
     RAW_SHEETS, ORDER_STATUS_GROUPS, NATIVE_EXPORT_DEFAULTS, STAGING_SPREADSHEET_ID_DEFAULT,
     NOT_SHIPPED_TAB, get_client, read_existing_keys, read_not_shipped_rows,
     find_stale_not_shipped, classify_native_export_orders, filter_new, rows_to_dataframe,
-    rows_to_excel_bytes, append_to_staging, read_any, default_mapping,
+    rows_to_excel_bytes, append_to_staging, read_many, default_mapping,
 )
 
 st.set_page_config(page_title="Orders Status Check (Native Export)", layout="wide")
@@ -86,15 +86,30 @@ target_key = st.selectbox(
     format_func=lambda k: RAW_SHEETS[k]['label'],
 )
 
-st.header("2. Shopify \"Export orders\" file")
-shopify_file = st.file_uploader(
-    "Shopify native export (csv or xlsx) -- Orders page -> Export -- every status, not just shipped",
-    type=['csv', 'xlsx', 'xls'],
+st.header("2. Shopify \"Export orders\" file(s)")
+shopify_files = st.file_uploader(
+    "Shopify native export -- csv, xlsx, or .zip (Orders page -> Export -- every status, "
+    "not just shipped). Drag on as many at once as you want -- when Shopify splits a big "
+    "export into several orders_export_N.zip links in one email, just download all of "
+    "them and drop every zip here together, no need to unzip or sort into folders first; "
+    "each zip's contents (at any folder depth inside it) are read automatically.",
+    type=['csv', 'xlsx', 'xls', 'zip'],
+    accept_multiple_files=True,
 )
 
-if shopify_file is not None:
-    shopify_df = read_any(shopify_file)
-    st.write(f"{len(shopify_df)} rows loaded.")
+if shopify_files:
+    shopify_df, load_stats = read_many(shopify_files)
+    st.write(
+        f"{len(shopify_df)} rows loaded from {len(load_stats['files_read'])} file(s) "
+        f"across {len(shopify_files)} upload(s)."
+    )
+    if load_stats['files_skipped']:
+        with st.expander(f"⚠️ {len(load_stats['files_skipped'])} item(s) skipped"):
+            for nm, reason in load_stats['files_skipped']:
+                st.write(f"- {nm}: {reason}")
+    if shopify_df.empty:
+        st.error("No readable csv/xlsx/xls data found in what was uploaded.")
+        st.stop()
 
     guessed = default_mapping(shopify_df.columns.tolist(), NATIVE_EXPORT_DEFAULTS)
     fields_needed = [
