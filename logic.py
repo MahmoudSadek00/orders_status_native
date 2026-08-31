@@ -114,7 +114,17 @@ NATIVE_EXPORT_DEFAULTS = {
     'source': ['Source'],
     'financial_status': ['Financial Status'],
     'fulfillment_status': ['Fulfillment Status'],
+    'tags': ['Tags'],
 }
+
+# A manually-applied Tag containing "cancel" in any form/case (e.g. "Cancelled",
+# "CANCEL - customer request", "cancel_by_agent") also counts as a real cancellation
+# (Aug 2026, per Mahmoud) -- agents tag an order this way sometimes without ever using
+# Shopify's own Cancel-order button (which is what sets Cancelled at) and without it
+# necessarily being refunded yet either (which is what REFUND_CANCEL_STATUSES above
+# catches). A simple substring match, not an exact-value match, since the tag text
+# itself isn't standardized.
+CANCEL_TAG_SUBSTRING = 'cancel'
 
 # A 'refunded' order whose Fulfillment Status ISN'T 'fulfilled' means the money went
 # back to the customer without the order ever shipping -- functionally a cancellation,
@@ -492,16 +502,17 @@ def find_stale_not_shipped(not_shipped_rows, raw_keys):
 
 def classify_native_export_orders(shopify_df, target_key, mapping):
     """mapping: dict with keys ref_number / order_date / order_value / country / city /
-    cancelled_at / source / financial_status / fulfillment_status -- see
+    cancelled_at / source / financial_status / fulfillment_status / tags -- see
     NATIVE_EXPORT_DEFAULTS. order_value ('Subtotal') is populated only on each order's
     first row and blank on later line-item rows for the same order -- filtering to
     non-blank order_value both selects the first row per order and needs no sum across
     rows (see module docstring). order_value itself already excludes shipping, no
-    derivation needed. An order counts as Cancelled if EITHER cancelled_at is non-blank
-    (a real timestamp, not a TRUE/1/YES flag), OR financial_status is 'refunded' while
-    fulfillment_status isn't 'fulfilled' -- money back before it ever shipped, which is
-    a cancellation in every way that matters even if nobody clicked Shopify's own
-    "Cancel order" button (see REFUND_CANCEL_STATUSES).
+    derivation needed. An order counts as Cancelled if ANY of: cancelled_at is non-blank
+    (a real timestamp, not a TRUE/1/YES flag); financial_status is 'refunded'/
+    'partially_refunded' while fulfillment_status isn't 'fulfilled' (see
+    REFUND_CANCEL_STATUSES); or tags contains "cancel" in any form/case (see
+    CANCEL_TAG_SUBSTRING) -- none of these require anyone to have clicked Shopify's own
+    "Cancel order" button.
 
     Returns (rows, stats)."""
     ref_col = mapping.get('ref_number')
@@ -513,6 +524,7 @@ def classify_native_export_orders(shopify_df, target_key, mapping):
     source_col = mapping.get('source')
     financial_status_col = mapping.get('financial_status')
     fulfillment_status_col = mapping.get('fulfillment_status')
+    tags_col = mapping.get('tags')
 
     work = shopify_df.copy()
     work = work[work[ref_col].astype(str).str.strip() != '']
@@ -578,6 +590,10 @@ def classify_native_export_orders(shopify_df, target_key, mapping):
                 )
                 if fulfil_status != 'fulfilled':
                     is_cancelled = True
+        if not is_cancelled and tags_col:
+            tags_val = str(r.get(tags_col, '')).strip().lower()
+            if CANCEL_TAG_SUBSTRING in tags_val:
+                is_cancelled = True
 
         rows.append({
             'key': r['_key'],
