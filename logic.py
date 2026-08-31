@@ -206,35 +206,22 @@ def fix_mojibake(s):
 SUPPORTED_EXTS = ('.csv', '.xlsx', '.xls')
 
 
-def _read_bytes(name: str, data: bytes) -> pd.DataFrame:
+def _read_bytes(name: str, data: bytes, usecols=None, nrows=None) -> pd.DataFrame:
+    # usecols as a callable (not a fixed list) never raises if a column is absent from a
+    # particular part -- it just keeps whichever of the wanted names are actually there,
+    # which matters across 70+ files that may not all share the exact same column set.
+    col_filter = (lambda c: c in usecols) if usecols else None
     buf = io.BytesIO(data)
     if name.lower().endswith('.csv'):
-        return pd.read_csv(buf, dtype=str, keep_default_na=False)
-    return pd.read_excel(buf, dtype=str, keep_default_na=False)
+        return pd.read_csv(buf, dtype=str, keep_default_na=False, usecols=col_filter, nrows=nrows)
+    return pd.read_excel(buf, dtype=str, keep_default_na=False, usecols=col_filter, nrows=nrows)
 
 
-def read_any(file) -> pd.DataFrame:
-    name = getattr(file, 'name', str(file))
-    data = file.getvalue() if hasattr(file, 'getvalue') else file.read()
-    return _read_bytes(name, data)
-
-
-def read_many(files):
-    """Reads any mix of uploaded csv/xlsx/xls files AND .zip files in one go (Aug 2026,
-    per Mahmoud -- Shopify splits a big "Export orders" run into several
-    orders_export_N.zip download links, all in ONE email, and across the Gulf country
-    groups these pile up into dozens of downloaded zips/folders). Each zip can itself
-    contain any number of csv/xlsx/xls files nested at any folder depth -- every part
-    just gets dragged onto the uploader together, zipped or already-extracted, no manual
-    unzip/re-foldering needed first.
-
-    Returns (combined_df, stats) where stats has 'files_read' (source file names actually
-    parsed, zip entries shown as "zipname -> entry path") and 'files_skipped'
-    ((name, reason) pairs for anything that wasn't a recognized data file, e.g. a stray
-    __MACOSX entry or a non-data attachment that slipped into the selection)."""
-    frames = []
-    files_read = []
-    files_skipped = []
+def _iter_data_entries(files):
+    """Yields (source_label, name, data_bytes) for every csv/xlsx/xls found across the
+    given uploads -- diving into any .zip (at any folder depth inside it) -- without
+    holding more than one entry's raw bytes at a time. Shared by read_headers/read_many
+    so both walk the exact same set of files/entries."""
     for f in files:
         name = getattr(f, 'name', str(f))
         data = f.getvalue() if hasattr(f, 'getvalue') else f.read()
@@ -248,30 +235,98 @@ def read_many(files):
                         if info.is_dir() or not base or base.startswith('.') or '__MACOSX' in entry_name:
                             continue
                         if not base.lower().endswith(SUPPORTED_EXTS):
-                            files_skipped.append((f"{name} -> {entry_name}", "not a csv/xlsx/xls file"))
+                            yield ('skip', f"{name} -> {entry_name}", "not a csv/xlsx/xls file")
                             continue
                         try:
                             with zf.open(info) as zf_entry:
-                                frames.append(_read_bytes(base, zf_entry.read()))
-                            files_read.append(f"{name} -> {entry_name}")
+                                entry_bytes = zf_entry.read()
                         except Exception as e:
-                            files_skipped.append((f"{name} -> {entry_name}", str(e)))
+                            yield ('skip', f"{name} -> {entry_name}", str(e))
+                            continue
+                        yield ('data', f"{name} -> {entry_name}", (base, entry_bytes))
             except Exception as e:
-                files_skipped.append((name, f"couldn't open as a zip: {e}"))
+                yield ('skip', name, f"couldn't open as a zip: {e}")
         elif lower.endswith(SUPPORTED_EXTS):
-            try:
-                frames.append(_read_bytes(name, data))
-                files_read.append(name)
-            except Exception as e:
-                files_skipped.append((name, str(e)))
+            yield ('data', name, (name, data))
         else:
-            files_skipped.append((name, "unsupported file type"))
+            yield ('skip', name, "unsupported file type")
+        del data
+
+
+def read_headers(files):
+    """Cheaply peeks at just the column headers of the FIRST readable file/zip-entry
+    among the uploads (Aug 2026, per Mahmoud -- with 70+ files/folders in one go, fully
+    parsing every one of them just to populate the column-mapping dropdowns was what ran
+    the app out of memory). Every part of the same "Export orders" run shares one schema,
+    so one file's headers are enough to build the mapping UI; the full, multi-file read
+    only happens afterwards in read_many, and only for the columns actually mapped."""
+    for kind, label, payload in _iter_data_entries(files):
+        if kind != 'data':
+            continue
+        base, data = payload
+        try:
+            df0 = _read_bytes(base, data, nrows=0)
+            return df0.columns.tolist()
+        except Exception:
+            continue
+    return []
+
+
+def read_many(files, usecols=None, on_progress=None):
+    """Reads any mix of uploaded csv/xlsx/xls files AND .zip files in one go (Aug 2026,
+    per Mahmoud -- Shopify splits a big "Export orders" run into several
+    orders_export_N.zip download links, all in ONE email, and across the Gulf country
+    groups these pile up into dozens of downloaded zips/folders). Each zip can itself
+    contain any number of csv/xlsx/xls files nested at any folder depth -- every part
+    just gets dragged onto the uploader together, zipped or already-extracted, no manual
+    unzip/re-foldering needed first.
+
+    usecols, if given, restricts every file/entry to just those column names (see
+    read_headers above) -- across 70+ files this is what keeps memory in check, since a
+    native Shopify export can carry dozens of columns per row but this app only ever
+    needs ~9 of them. on_progress, if given, is called after each entry as
+    on_progress(done_count, total_count, label) -- purely cosmetic (e.g. a progress bar),
+    no Streamlit dependency here.
+
+    Returns (combined_df, stats) where stats has 'files_read' (source file names actually
+    parsed, zip entries shown as "zipname -> entry path") and 'files_skipped'
+    ((name, reason) pairs for anything that wasn't a recognized data file, e.g. a stray
+    __MACOSX entry or a non-data attachment that slipped into the selection)."""
+    import gc
+
+    entries = list(_iter_data_entries(files))
+    total = len(entries)
+    frames = []
+    files_read = []
+    files_skipped = []
+    for i, (kind, label, payload) in enumerate(entries, start=1):
+        if kind == 'skip':
+            files_skipped.append((label, payload))
+        else:
+            base, data = payload
+            try:
+                frames.append(_read_bytes(base, data, usecols=usecols))
+                files_read.append(label)
+            except Exception as e:
+                files_skipped.append((label, str(e)))
+        if on_progress:
+            on_progress(i, total, label)
+        if i % 10 == 0:
+            gc.collect()
 
     stats = {'files_read': files_read, 'files_skipped': files_skipped}
     if not frames:
         return pd.DataFrame(), stats
     combined = pd.concat(frames, ignore_index=True, sort=False).fillna('')
+    del frames
+    gc.collect()
     return combined, stats
+
+
+def read_any(file) -> pd.DataFrame:
+    name = getattr(file, 'name', str(file))
+    data = file.getvalue() if hasattr(file, 'getvalue') else file.read()
+    return _read_bytes(name, data)
 
 
 def guess_column(columns, candidates):
