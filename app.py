@@ -8,7 +8,7 @@ from logic import (
     RAW_SHEETS, ORDER_STATUS_GROUPS, NATIVE_EXPORT_DEFAULTS, STAGING_SPREADSHEET_ID_DEFAULT,
     NOT_SHIPPED_TAB, get_client, read_existing_keys, read_not_shipped_rows,
     find_stale_not_shipped, classify_native_export_orders, filter_new, rows_to_dataframe,
-    rows_to_excel_bytes, append_to_staging, read_many, default_mapping,
+    rows_to_excel_bytes, append_to_staging, read_headers, read_many, default_mapping,
 )
 
 st.set_page_config(page_title="Orders Status Check (Native Export)", layout="wide")
@@ -98,20 +98,17 @@ shopify_files = st.file_uploader(
 )
 
 if shopify_files:
-    shopify_df, load_stats = read_many(shopify_files)
-    st.write(
-        f"{len(shopify_df)} rows loaded from {len(load_stats['files_read'])} file(s) "
-        f"across {len(shopify_files)} upload(s)."
-    )
-    if load_stats['files_skipped']:
-        with st.expander(f"⚠️ {len(load_stats['files_skipped'])} item(s) skipped"):
-            for nm, reason in load_stats['files_skipped']:
-                st.write(f"- {nm}: {reason}")
-    if shopify_df.empty:
-        st.error("No readable csv/xlsx/xls data found in what was uploaded.")
+    st.caption(f"{len(shopify_files)} upload(s) selected.")
+    # Only peeks at ONE file's column headers here (Aug 2026, per Mahmoud -- fully
+    # reading all 70+ files just to populate the mapping dropdowns below is what ran the
+    # app out of memory before). The real, full read happens only once you hit "Check"
+    # below, and only for the columns you actually map -- see read_many's usecols.
+    header_columns = read_headers(shopify_files)
+    if not header_columns:
+        st.error("Couldn't read column headers from any of the uploaded files -- check they're valid csv/xlsx/xls (or zips containing them).")
         st.stop()
 
-    guessed = default_mapping(shopify_df.columns.tolist(), NATIVE_EXPORT_DEFAULTS)
+    guessed = default_mapping(header_columns, NATIVE_EXPORT_DEFAULTS)
     fields_needed = [
         'ref_number', 'order_date', 'order_value', 'country', 'city', 'cancelled_at',
         'source', 'financial_status', 'fulfillment_status',
@@ -128,7 +125,7 @@ if shopify_files:
     cols = st.columns(3)
     for i, field in enumerate(fields_needed):
         with cols[i % 3]:
-            options = ['(none)'] + shopify_df.columns.tolist()
+            options = ['(none)'] + header_columns
             default = guessed.get(field)
             idx = options.index(default) if default in options else 0
             choice = st.selectbox(labels[field], options, index=idx, key=f'native_{target_key}_{field}')
@@ -154,6 +151,31 @@ if shopify_files:
 
     st.header("3. Check & add")
     if st.button("Check against the raw sheets + staging", disabled=not ready, type="primary"):
+        # The real, full read of every uploaded file/zip-entry happens only now, and only
+        # for the ~9 columns actually mapped above (Aug 2026, per Mahmoud -- across 70+
+        # files, reading every original Shopify column for every row is what exhausted
+        # memory; trimming to just what classify_native_export_orders needs fixes that).
+        wanted_cols = {c for c in mapping.values() if c}
+        progress_bar = st.progress(0.0, text="Reading uploaded file(s)...")
+
+        def _on_progress(done, total, label):
+            frac = done / total if total else 1.0
+            progress_bar.progress(frac, text=f"Reading file {done}/{total}: {label}")
+
+        shopify_df, load_stats = read_many(shopify_files, usecols=wanted_cols, on_progress=_on_progress)
+        progress_bar.empty()
+        st.write(
+            f"{len(shopify_df)} rows loaded from {len(load_stats['files_read'])} file(s) "
+            f"across {len(shopify_files)} upload(s)."
+        )
+        if load_stats['files_skipped']:
+            with st.expander(f"⚠️ {len(load_stats['files_skipped'])} item(s) skipped"):
+                for nm, reason in load_stats['files_skipped']:
+                    st.write(f"- {nm}: {reason}")
+        if shopify_df.empty:
+            st.error("No readable csv/xlsx/xls data found in what was uploaded.")
+            st.stop()
+
         try:
             with st.spinner("Reading the 3 raw sheets and the staging Orders + Not Shipped tabs..."):
                 existing_keys, raw_keys, counts = read_existing_keys(gc, staging_id)
