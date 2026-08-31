@@ -123,8 +123,50 @@ NATIVE_EXPORT_DEFAULTS = {
 # Shopify's own Cancel-order button (which is what sets Cancelled at) and without it
 # necessarily being refunded yet either (which is what REFUND_CANCEL_STATUSES above
 # catches). A simple substring match, not an exact-value match, since the tag text
-# itself isn't standardized.
+# itself isn't standardized. ALSO tolerates typos in the word itself (confirmed real
+# case, Aug 2026: a tag literally spelled "CANACEL") via a small edit-distance check on
+# each individual word of the tag -- a plain substring check can never catch a misspelled
+# word, since the exact letters "cancel" never appear anywhere in "canacel".
 CANCEL_TAG_SUBSTRING = 'cancel'
+CANCEL_TAG_MAX_EDIT_DISTANCE = 2
+_CANCEL_TAG_WORD_LEN_RANGE = (len(CANCEL_TAG_SUBSTRING) - 3, len(CANCEL_TAG_SUBSTRING) + 3)
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Plain edit distance (insertions/deletions/substitutions), no external deps --
+    small inputs only (single words), so the simple O(len(a)*len(b)) table is fine."""
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i] + [0] * lb
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[lb]
+
+
+def _tag_implies_cancelled(tags_val: str) -> bool:
+    """tags_val must already be lowercased/cleaned. Fast path: plain substring (catches
+    "cancelled", "cancel_by_agent", etc.). Fallback: each individual word (split on the
+    usual tag separators) within a small edit distance of "cancel" -- catches a
+    misspelled tag like "CANACEL" without over-matching unrelated short words (the word
+    length is pre-filtered to stay close to "cancel"'s own length first)."""
+    if not tags_val:
+        return False
+    if CANCEL_TAG_SUBSTRING in tags_val:
+        return True
+    lo, hi = _CANCEL_TAG_WORD_LEN_RANGE
+    for word in re.split(r'[,;/|\s]+', tags_val):
+        if lo <= len(word) <= hi and _levenshtein(word, CANCEL_TAG_SUBSTRING) <= CANCEL_TAG_MAX_EDIT_DISTANCE:
+            return True
+    return False
 
 # A 'refunded' order whose Fulfillment Status ISN'T 'fulfilled' means the money went
 # back to the customer without the order ever shipping -- functionally a cancellation,
@@ -591,8 +633,11 @@ def classify_native_export_orders(shopify_df, target_key, mapping):
                 if fulfil_status != 'fulfilled':
                     is_cancelled = True
         if not is_cancelled and tags_col:
-            tags_val = str(r.get(tags_col, '')).strip().lower()
-            if CANCEL_TAG_SUBSTRING in tags_val:
+            # clean_display strips invisible/combining Unicode noise first -- a Tags
+            # cell with a stray hidden character sitting inside the word would otherwise
+            # silently defeat the substring/fuzzy check in _tag_implies_cancelled.
+            tags_val = clean_display(r.get(tags_col, '')).lower()
+            if _tag_implies_cancelled(tags_val):
                 is_cancelled = True
 
         rows.append({
