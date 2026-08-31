@@ -20,15 +20,13 @@ st.caption(
     "file's own Subtotal (goods only, shipping already excluded -- no subtraction "
     "needed). Upload a full export (every status, not just shipped) for ONE country "
     "group. This checks every order against the 3 raw tracking sheets AND the staging "
-    f"Orders + \"{NOT_SHIPPED_TAB}\" tabs, and tracks only **Cancelled** orders that "
-    "aren't logged anywhere yet -- a Cancelled order never shows up on a raw sheet on "
-    "its own, so it needs tracking here or it's invisible forever. Pending orders are "
-    "deliberately left untouched -- the team logs those the normal way once they "
-    f"actually ship. New Cancelled orders get added to the \"{NOT_SHIPPED_TAB}\" tab "
-    "(not straight into Orders), and every run also flags anything sitting in "
-    f"\"{NOT_SHIPPED_TAB}\" that has since actually shown up on a raw sheet -- meaning "
-    "the team shipped it for real after it was logged here. The 3 raw sheets "
-    "themselves are never touched -- read-only."
+    f"Orders + \"{NOT_SHIPPED_TAB}\" tabs, and shows only the orders that aren't logged "
+    "anywhere yet -- so Cancelled orders and orders still awaiting shipment finally get "
+    f"counted, without ever duplicating a row that's already there. New orders get "
+    f"added to the \"{NOT_SHIPPED_TAB}\" tab (not straight into Orders), and every run "
+    f"also flags anything sitting in \"{NOT_SHIPPED_TAB}\" that has since actually shown "
+    "up on a raw sheet -- meaning the team shipped it for real after it was logged here. "
+    "The 3 raw sheets themselves are never touched -- read-only."
 )
 
 
@@ -175,30 +173,22 @@ if shopify_file is not None:
                 st.dataframe(pd.DataFrame(stale), use_container_width=True)
 
         rows, stats = classify_native_export_orders(shopify_df, target_key, mapping)
-        new_rows_all = filter_new(rows, existing_keys)
-        # Only Cancelled orders get tracked here (Aug 2026, per Mahmoud) -- Pending ones
-        # are left out on purpose: a Cancelled order will NEVER show up on a raw sheet
-        # on its own (that only happens once an order ships), so it genuinely needs this
-        # separate tracking or it's invisible forever. A Pending order, on the other
-        # hand, is just an order still waiting its turn -- the team will add it to the
-        # raw sheet themselves the normal way once it actually ships, no help needed
-        # here. This also sidesteps a brand-new order (just placed, still
-        # pending-payment/unfulfilled) getting flagged before anyone's even had a
-        # chance to process it -- it simply isn't tracked by this tool at all.
-        new_rows = [r for r in new_rows_all if r['status'] == 'Cancelled']
-        n_pending_skipped = len(new_rows_all) - len(new_rows)
+        # Back to tracking both Cancelled AND Pending (Aug 2026, per Mahmoud -- reverted
+        # the Cancelled-only restriction; a brand-new Pending order just shows up as
+        # Pending normally, no grace period held back for it).
+        new_rows = filter_new(rows, existing_keys)
+        n_canceled = sum(1 for r in new_rows if r['status'] == 'Cancelled')
+        n_pending = len(new_rows) - n_canceled
 
         st.success(
             f"{stats['orders_total']} distinct order(s) in this export "
             f"({stats['pos_excluded_count']} POS/in-store order(s) excluded -- never "
-            f"shipped, so never tracked here). {len(rows) - len(new_rows_all)} already "
+            f"shipped, so never tracked here). {len(rows) - len(new_rows)} already "
             f"logged somewhere (a raw sheet, the staging sheet, or a previous run of "
-            f"this tool) -- skipped, never duplicated. **{len(new_rows)} NEW Cancelled "
-            f"order(s) to add.** {n_pending_skipped} still-Pending order(s) were left "
-            f"out on purpose -- the team will log them the normal way once they "
-            f"actually ship. {stats['blank_country_count']} had no Shipping country on "
-            f"file despite not being POS (Draft order, expected -- defaulted, not "
-            f"flagged)."
+            f"this tool) -- skipped, never duplicated. **{len(new_rows)} NEW order(s) "
+            f"to add**: {n_canceled} Cancelled, {n_pending} Pending. "
+            f"{stats['blank_country_count']} had no Shipping country on file despite "
+            f"not being POS (Draft order, expected -- defaulted, not flagged)."
         )
 
         review = [r for r in new_rows if r['needs_review']]
@@ -211,7 +201,7 @@ if shopify_file is not None:
 
     new_rows = st.session_state.get('new_rows')
     if new_rows is not None and st.session_state.get('new_rows_target_key') == target_key:
-        st.subheader(f"{len(new_rows)} new Cancelled order(s) ready")
+        st.subheader(f"{len(new_rows)} new order(s) ready")
         if new_rows:
             preview_df = rows_to_dataframe(new_rows)
             st.dataframe(preview_df, use_container_width=True)
