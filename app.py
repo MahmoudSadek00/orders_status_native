@@ -220,7 +220,10 @@ if shopify_files:
         st.success(
             f"{stats['orders_total']} distinct order(s) in this export "
             f"({stats['pos_excluded_count']} POS/in-store order(s) excluded -- never "
-            f"shipped, so never tracked here). {len(rows) - len(new_rows)} already "
+            f"shipped, so never tracked here"
+            + (f"; {stats['excluded_country_count']} Bahrain order(s) excluded -- not a "
+               f"served market" if stats.get('excluded_country_count') else "")
+            + f"). {len(rows) - len(new_rows)} already "
             f"logged somewhere (a raw sheet, the staging sheet, or a previous run of "
             f"this tool) -- skipped, never duplicated. **{len(new_rows)} NEW order(s) "
             f"to add**: {n_canceled} Cancelled, {n_pending} Pending. "
