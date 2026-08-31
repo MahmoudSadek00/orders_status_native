@@ -111,7 +111,7 @@ if shopify_files:
     guessed = default_mapping(header_columns, NATIVE_EXPORT_DEFAULTS)
     fields_needed = [
         'ref_number', 'order_date', 'order_value', 'country', 'city', 'cancelled_at',
-        'source', 'financial_status', 'fulfillment_status',
+        'source', 'financial_status', 'fulfillment_status', 'tags',
     ]
     labels = {
         'ref_number': 'Reference / Order Number ("Name")', 'order_date': 'Order date ("Created at")',
@@ -120,6 +120,7 @@ if shopify_files:
         'source': 'Sales channel ("Source") -- excludes POS/in-store orders',
         'financial_status': 'Financial status (catches refunded-before-shipped as Cancelled too)',
         'fulfillment_status': 'Fulfillment status (used with Financial status above)',
+        'tags': 'Tags column (any tag containing "cancel" = Cancelled too)',
     }
     mapping = {}
     cols = st.columns(3)
@@ -142,6 +143,8 @@ if shopify_files:
             "No Financial status column mapped -- a refunded-before-it-ever-shipped "
             "order won't be caught as Cancelled unless Cancelled-at is also set."
         )
+    if not mapping.get('tags'):
+        st.caption("No Tags column mapped -- an order manually tagged \"cancel...\" won't be caught as Cancelled unless Cancelled-at or Financial status already flags it.")
 
     ready = bool(mapping.get('ref_number'))
     if not ready:
