@@ -517,13 +517,37 @@ def read_existing_keys(gc, staging_spreadsheet_id):
 
 
 def read_not_shipped_rows(gc, staging_spreadsheet_id):
-    """Full rows (as dicts, keyed by header) currently sitting in the staging
-    'Not Shipped' tab. A full read here is fine -- unlike the 3 raw sheets, this tab
-    only ever holds what Mahmoud has manually added through this app, so it stays small.
-    Used only by find_stale_not_shipped."""
+    """Full rows (as dicts, keyed by header, PLUS a '_row_index' key -- the row's actual
+    1-based row number in the sheet, e.g. 2 for the first data row right under the
+    header) currently sitting in the staging 'Not Shipped' tab. A full read here is fine
+    -- unlike the 3 raw sheets, this tab only ever holds what Mahmoud has manually added
+    through this app, so it stays small. _row_index is what delete_not_shipped_rows
+    needs to remove specific rows later; get_all_records() returns rows in the same
+    order as the sheet with none skipped, so row i of the list is always sheet row
+    i + 2."""
     staging_sh = _call_with_retry(lambda: gc.open_by_key(staging_spreadsheet_id))
     ws = _call_with_retry(lambda: staging_sh.worksheet(NOT_SHIPPED_TAB))
-    return _call_with_retry(lambda: ws.get_all_records())
+    records = _call_with_retry(lambda: ws.get_all_records())
+    for i, row in enumerate(records, start=2):
+        row['_row_index'] = i
+    return records
+
+
+def delete_not_shipped_rows(gc, staging_spreadsheet_id, row_indices):
+    """Deletes the given physical row numbers (from read_not_shipped_rows' _row_index)
+    from the staging 'Not Shipped' tab -- used to clean up rows find_stale_not_shipped
+    flagged as since-actually-shipped (Aug 2026, per Mahmoud: a standalone cleanup, no
+    file upload needed, since staleness only depends on the 3 raw sheets + this tab).
+    Deletes from the BOTTOM row up so earlier deletions in the loop never shift the row
+    numbers of ones still waiting to be deleted above them. Returns the count removed."""
+    unique_indices = sorted(set(row_indices), reverse=True)
+    if not unique_indices:
+        return 0
+    staging_sh = _call_with_retry(lambda: gc.open_by_key(staging_spreadsheet_id))
+    ws = _call_with_retry(lambda: staging_sh.worksheet(NOT_SHIPPED_TAB))
+    for idx in unique_indices:
+        _call_with_retry(lambda idx=idx: ws.delete_rows(idx))
+    return len(unique_indices)
 
 
 def find_stale_not_shipped(not_shipped_rows, raw_keys):
