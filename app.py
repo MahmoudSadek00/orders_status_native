@@ -7,8 +7,9 @@ import streamlit as st
 from logic import (
     RAW_SHEETS, ORDER_STATUS_GROUPS, NATIVE_EXPORT_DEFAULTS, STAGING_SPREADSHEET_ID_DEFAULT,
     NOT_SHIPPED_TAB, get_client, read_existing_keys, read_not_shipped_rows,
-    find_stale_not_shipped, classify_native_export_orders, filter_new, rows_to_dataframe,
-    rows_to_excel_bytes, append_to_staging, read_headers, read_many, default_mapping,
+    find_stale_not_shipped, delete_not_shipped_rows, classify_native_export_orders,
+    filter_new, rows_to_dataframe, rows_to_excel_bytes, append_to_staging, read_headers,
+    read_many, default_mapping,
 )
 
 st.set_page_config(page_title="Orders Status Check (Native Export)", layout="wide")
@@ -78,6 +79,51 @@ try:
 except Exception as e:
     st.error(f"Couldn't connect to Google Sheets with the configured credential: {e}")
     st.stop()
+
+st.header(f"🧹 Clean up \"{NOT_SHIPPED_TAB}\"")
+st.caption(
+    "Standalone check -- no file upload needed, doesn't depend on a country group "
+    "either. Looks at the 3 raw sheets (live, read-only) and the staging "
+    f"\"{NOT_SHIPPED_TAB}\" tab, and flags any order sitting in "
+    f"\"{NOT_SHIPPED_TAB}\" that has SINCE actually shown up on a raw sheet -- meaning "
+    "the team shipped it for real after it was logged here as Cancelled/Pending. Run "
+    "this any time, on its own, to keep the two in sync."
+)
+if st.button(f"Check the raw sheets for orders already in \"{NOT_SHIPPED_TAB}\""):
+    try:
+        with st.spinner("Reading the 3 raw sheets and the staging Not Shipped tab..."):
+            _, cleanup_raw_keys, _ = read_existing_keys(gc, staging_id)
+            cleanup_not_shipped_rows = read_not_shipped_rows(gc, staging_id)
+            cleanup_stale = find_stale_not_shipped(cleanup_not_shipped_rows, cleanup_raw_keys)
+    except Exception as e:
+        st.error(f"Couldn't run the check: {e}")
+        cleanup_stale = None
+
+    if cleanup_stale is not None:
+        st.session_state['cleanup_stale'] = cleanup_stale
+
+cleanup_stale = st.session_state.get('cleanup_stale')
+if cleanup_stale is not None:
+    if cleanup_stale:
+        st.warning(f"{len(cleanup_stale)} order(s) in \"{NOT_SHIPPED_TAB}\" have since shown up on a raw sheet.")
+        st.dataframe(
+            pd.DataFrame(cleanup_stale).drop(columns=['_row_index'], errors='ignore'),
+            use_container_width=True,
+        )
+        if st.button(f"Remove these {len(cleanup_stale)} row(s) from \"{NOT_SHIPPED_TAB}\"", type="primary"):
+            try:
+                with st.spinner(f"Removing from \"{NOT_SHIPPED_TAB}\"..."):
+                    n = delete_not_shipped_rows(
+                        gc, staging_id, [r['_row_index'] for r in cleanup_stale]
+                    )
+                st.success(f"{n} row(s) removed from \"{NOT_SHIPPED_TAB}\".")
+                st.session_state.pop('cleanup_stale', None)
+            except Exception as e:
+                st.error(f"Couldn't remove those rows: {e}")
+    else:
+        st.info(f"Nothing stale -- every order in \"{NOT_SHIPPED_TAB}\" is still genuinely unshipped.")
+
+st.divider()
 
 st.header("1. Country group")
 target_key = st.selectbox(
