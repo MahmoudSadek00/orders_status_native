@@ -135,6 +135,48 @@ def _activity_ts_key(v):
     return parsed.strftime('%Y-%m-%d %H:%M:%S')
 
 
+def _activity_ts_candidates(v):
+    """Like _activity_ts_key, but returns a SET of every canonical reading a legacy
+    EXISTING sheet cell could plausibly be -- TWO candidates when the day and month are
+    both <=12 and therefore genuinely ambiguous. This matters specifically for a live
+    sheet that's accumulated rows from more than one source over time: some rows this
+    app itself appends (always the literal, correct DD-MM-YYYY text, never ambiguous on
+    that side), but older rows may have been entered by some other process that stored
+    an ambiguous date the OTHER way round (day and month swapped) without anyone
+    noticing, since e.g. '08-09-2026' and '09-08-2026' are both valid-looking dates.
+    Used only when building the EXISTING-side key set (read_existing_keys) -- a freshly
+    uploaded native-export row's OWN timestamp is never ambiguous, so upload-side
+    matching (row_key, used by dedupe_and_filter) stays single-candidate on purpose."""
+    if v is None or v == '' or isinstance(v, bool):
+        return set()
+    base = None
+    if isinstance(v, (int, float)):
+        try:
+            base = dt.datetime.combine(GOOGLE_SHEETS_EPOCH, dt.time()) + dt.timedelta(days=float(v))
+        except (OverflowError, ValueError, OSError):
+            return set()
+    else:
+        s = clean_display(v)
+        if not s:
+            return set()
+        try:
+            base = dt.datetime.strptime(s, '%d-%m-%Y %H:%M:%S')
+        except ValueError:
+            parsed = pd.to_datetime(s, dayfirst=True, errors='coerce')
+            if pd.isna(parsed):
+                return set()
+            base = parsed.to_pydatetime()
+
+    out = {base.strftime('%Y-%m-%d %H:%M:%S')}
+    if base.day <= 12 and base.month != base.day:
+        try:
+            swapped = base.replace(month=base.day, day=base.month)
+            out.add(swapped.strftime('%Y-%m-%d %H:%M:%S'))
+        except ValueError:
+            pass
+    return out
+
+
 def row_key(data_type, row):
     """row: a dict/Series of column name -> value (works for both a freshly-uploaded
     file's row and a raw live-sheet cell row). Returns one string key, or None if this
@@ -154,43 +196,76 @@ def row_key(data_type, row):
     raise ValueError(f"unknown data_type {data_type!r}")
 
 
+def _find_col(header, name):
+    """Case/whitespace-tolerant column lookup -- returns the 0-based index of the first
+    header cell matching `name` once both are stripped and casefolded, or None. Guards
+    against a live header that's technically the same column but not a byte-for-byte
+    match (stray trailing space, different case) silently making read_existing_keys
+    think the whole tab is empty."""
+    target = name.strip().casefold()
+    for i, h in enumerate(header):
+        if str(h).strip().casefold() == target:
+            return i
+    return None
+
+
 def read_existing_keys(gc, spreadsheet_id, data_type):
-    """Reads only the column(s) row_key() actually needs from the live tab -- not the
+    """Reads only the column(s) needed to de-duplicate from the live tab -- not the
     whole sheet -- same reasoning as orders_status_native's own _col_keys (a large real
     sheet, and this CS one is large, can trip a 503 if asked to read every column just
-    to check one or two of them). Returns (keys, existing_row_count). An empty/missing
-    tab, or one that doesn't even have the key column(s) yet, is treated as "no rows
-    logged yet" rather than raising -- append_new_rows still seeds a fresh header row
-    the first time it appends to a genuinely empty tab."""
+    to check one or two of them). Returns (keys, existing_row_count, sample) where
+    sample is up to 3 (raw_row_values, computed_key(s)) pairs -- purely diagnostic, so a
+    mismatch between what's actually on the sheet and what this app computes is visible
+    on screen instead of having to be guessed at. An empty/missing tab, or one that
+    doesn't even have the key column(s) yet, is treated as "no rows logged yet" rather
+    than raising -- append_new_rows still seeds a fresh header row the first time it
+    appends to a genuinely empty tab.
+
+    Agent Activity gets EVERY plausible canonical reading of each existing row's
+    Timestamp added to the key set (see _activity_ts_candidates) -- not just one -- to
+    also catch a legacy row whose day/month may have been swapped by whatever process
+    originally wrote it, long before this app existed. Calls/Chats have a genuine
+    unique ID so there's no such ambiguity to account for."""
     cfg = DATA_TYPES[data_type]
     sh = _call_with_retry(lambda: gc.open_by_key(spreadsheet_id))
     try:
         ws = _call_with_retry(lambda: sh.worksheet(cfg['tab']))
     except gspread.WorksheetNotFound:
-        return set(), 0
+        return set(), 0, []
 
     header = _call_with_retry(lambda: ws.row_values(1))
     if not header:
-        return set(), 0
+        return set(), 0, []
 
     needed = cfg['key_columns']
     cols = {}
     for col_name in needed:
-        if col_name not in header:
-            return set(), 0  # tab exists but doesn't have the key column -- can't match against it
-        idx = header.index(col_name)
+        idx = _find_col(header, col_name)
+        if idx is None:
+            return set(), 0, []  # tab exists but doesn't have the key column -- can't match against it
         cols[col_name] = _call_with_retry(
             lambda idx=idx: ws.col_values(idx + 1, value_render_option=ValueRenderOption.unformatted)
         )
 
     n_rows = max((len(v) for v in cols.values()), default=1) - 1  # minus the header cell
     keys = set()
+    sample = []
     for i in range(1, n_rows + 1):
         row = {col_name: (vals[i] if i < len(vals) else None) for col_name, vals in cols.items()}
-        k = row_key(data_type, row)
-        if k:
-            keys.add(k)
-    return keys, max(n_rows, 0)
+        if data_type == 'agent_activity':
+            name = clean_key(row.get('Agent Name'))
+            ts_candidates = _activity_ts_candidates(row.get('Timestamp'))
+            row_keys = {f"{name}||{ts}" for ts in ts_candidates} if name and ts_candidates else set()
+            keys |= row_keys
+            if len(sample) < 3:
+                sample.append((row, sorted(row_keys)))
+        else:
+            k = row_key(data_type, row)
+            if k:
+                keys.add(k)
+            if len(sample) < 3:
+                sample.append((row, [k] if k else []))
+    return keys, max(n_rows, 0), sample
 
 
 def prepare_upload(data_type, files, on_progress=None):
