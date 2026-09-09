@@ -144,7 +144,7 @@ if files:
 
         try:
             with st.spinner(f"Reading the live \"{cfg['tab']}\" tab..."):
-                existing_keys, existing_count = read_existing_keys(gc, cs_spreadsheet_id, data_type)
+                existing_keys, existing_count, existing_sample = read_existing_keys(gc, cs_spreadsheet_id, data_type)
         except Exception as e:
             st.error(f"Couldn't read the sheet: {e}")
             st.stop()
@@ -157,6 +157,17 @@ if files:
             f"{len(df)} row(s) in this upload: {n_dupe} already logged (or duplicated "
             f"within this same upload) -- skipped. **{len(new_df)} NEW row(s) to add.**"
         )
+
+        with st.expander("Diagnostic -- sample of what was actually read off the sheet"):
+            st.caption(
+                "First 3 existing rows read from the sheet, and the matching key(s) "
+                "computed from them. If this ever looks wrong (e.g. an empty key list "
+                "for a row that clearly has data), that's the first thing to check."
+            )
+            for raw_row, computed_keys in existing_sample:
+                st.write(f"Raw: {raw_row}  ->  key(s): {computed_keys or '(none -- unmatched)'}")
+            if not existing_sample:
+                st.write("(no existing rows found on the sheet)")
 
         st.session_state['cs_new_df'] = new_df
         st.session_state['cs_new_df_type'] = data_type
