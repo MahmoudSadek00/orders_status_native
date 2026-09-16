@@ -538,15 +538,39 @@ def delete_not_shipped_rows(gc, staging_spreadsheet_id, row_indices):
     from the staging 'Not Shipped' tab -- used to clean up rows find_stale_not_shipped
     flagged as since-actually-shipped (Aug 2026, per Mahmoud: a standalone cleanup, no
     file upload needed, since staleness only depends on the 3 raw sheets + this tab).
-    Deletes from the BOTTOM row up so earlier deletions in the loop never shift the row
-    numbers of ones still waiting to be deleted above them. Returns the count removed."""
+
+    Sent as ONE batchUpdate call (chunked at 500 requests, so even a very large cleanup
+    stays a handful of calls) instead of one ws.delete_rows() call per row -- the old
+    per-row-call version cost N write requests for an N-row cleanup, which is exactly
+    what tripped 'Quota exceeded ... Write requests per minute per user' on a 222-row
+    removal (Sep 2026, per Mahmoud). Within a batchUpdate, Google still applies the
+    deleteDimension requests in the order given, so they're still listed BOTTOM row up
+    (highest index first) -- an earlier (higher-numbered) deletion applied first never
+    shifts the row numbers of the lower-numbered ones still waiting in the same batch.
+    Returns the count removed."""
     unique_indices = sorted(set(row_indices), reverse=True)
     if not unique_indices:
         return 0
     staging_sh = _call_with_retry(lambda: gc.open_by_key(staging_spreadsheet_id))
     ws = _call_with_retry(lambda: staging_sh.worksheet(NOT_SHIPPED_TAB))
-    for idx in unique_indices:
-        _call_with_retry(lambda idx=idx: ws.delete_rows(idx))
+    sheet_id = ws.id
+    requests = [
+        {
+            'deleteDimension': {
+                'range': {
+                    'sheetId': sheet_id,
+                    'dimension': 'ROWS',
+                    'startIndex': idx - 1,  # deleteDimension is 0-based, inclusive
+                    'endIndex': idx,        # ... and exclusive at the end
+                }
+            }
+        }
+        for idx in unique_indices
+    ]
+    CHUNK = 500
+    for i in range(0, len(requests), CHUNK):
+        chunk = requests[i:i + CHUNK]
+        _call_with_retry(lambda chunk=chunk: staging_sh.batch_update({'requests': chunk}))
     return len(unique_indices)
 
 
