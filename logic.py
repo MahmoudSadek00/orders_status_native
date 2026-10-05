@@ -278,39 +278,43 @@ def _read_bytes(name: str, data: bytes, usecols=None, nrows=None) -> pd.DataFram
 
 
 def _iter_data_entries(files):
-    """Yields (source_label, name, data_bytes) for every csv/xlsx/xls found across the
-    given uploads -- diving into any .zip (at any folder depth inside it) -- without
-    holding more than one entry's raw bytes at a time. Shared by read_headers/read_many
-    so both walk the exact same set of files/entries."""
+    """Yields (kind, label, payload) for every csv/xlsx/xls found across the given
+    uploads -- diving into any .zip (at any folder depth inside it).
+
+    payload for a 'data' entry is (base_name, loader) where loader() returns that
+    entry's raw bytes ONLY when called (Oct 2026 fix): the previous version read every
+    zip entry's bytes up front, and read_many() then did list() on this generator, so
+    every file in a big multi-zip upload sat in memory at the same time -- the opposite
+    of what the "one entry at a time" design intended. Now only the entry currently
+    being parsed is ever expanded in memory. Shared by read_headers/read_many so both
+    walk the exact same set of files/entries."""
     for f in files:
         name = getattr(f, 'name', str(f))
         data = f.getvalue() if hasattr(f, 'getvalue') else f.read()
         lower = name.lower()
         if lower.endswith('.zip'):
             try:
-                with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                    for info in zf.infolist():
-                        entry_name = info.filename
-                        base = entry_name.rsplit('/', 1)[-1]
-                        if info.is_dir() or not base or base.startswith('.') or '__MACOSX' in entry_name:
-                            continue
-                        if not base.lower().endswith(SUPPORTED_EXTS):
-                            yield ('skip', f"{name} -> {entry_name}", "not a csv/xlsx/xls file")
-                            continue
-                        try:
-                            with zf.open(info) as zf_entry:
-                                entry_bytes = zf_entry.read()
-                        except Exception as e:
-                            yield ('skip', f"{name} -> {entry_name}", str(e))
-                            continue
-                        yield ('data', f"{name} -> {entry_name}", (base, entry_bytes))
+                zf = zipfile.ZipFile(io.BytesIO(data))
             except Exception as e:
                 yield ('skip', name, f"couldn't open as a zip: {e}")
+                continue
+            for info in zf.infolist():
+                entry_name = info.filename
+                base = entry_name.rsplit('/', 1)[-1]
+                if info.is_dir() or not base or base.startswith('.') or '__MACOSX' in entry_name:
+                    continue
+                if not base.lower().endswith(SUPPORTED_EXTS):
+                    yield ('skip', f"{name} -> {entry_name}", "not a csv/xlsx/xls file")
+                    continue
+
+                def _load(zf=zf, info=info):
+                    with zf.open(info) as zf_entry:
+                        return zf_entry.read()
+                yield ('data', f"{name} -> {entry_name}", (base, _load))
         elif lower.endswith(SUPPORTED_EXTS):
-            yield ('data', name, (name, data))
+            yield ('data', name, (name, lambda data=data: data))
         else:
             yield ('skip', name, "unsupported file type")
-        del data
 
 
 def read_headers(files):
@@ -323,9 +327,9 @@ def read_headers(files):
     for kind, label, payload in _iter_data_entries(files):
         if kind != 'data':
             continue
-        base, data = payload
+        base, loader = payload
         try:
-            df0 = _read_bytes(base, data, nrows=0)
+            df0 = _read_bytes(base, loader(), nrows=0)
             return df0.columns.tolist()
         except Exception:
             continue
@@ -363,9 +367,9 @@ def read_many(files, usecols=None, on_progress=None):
         if kind == 'skip':
             files_skipped.append((label, payload))
         else:
-            base, data = payload
+            base, loader = payload
             try:
-                frames.append(_read_bytes(base, data, usecols=usecols))
+                frames.append(_read_bytes(base, loader(), usecols=usecols))
                 files_read.append(label)
             except Exception as e:
                 files_skipped.append((label, str(e)))
@@ -421,13 +425,18 @@ def get_client(service_account_info):
     return gspread.authorize(creds)
 
 
-def _call_with_retry(fn, max_retries=4):
-    """Runs fn() with short exponential backoff on transient Google API errors (429 rate
-    limit, or a 5xx like the 503 'service currently unavailable' Mahmoud hit on a large
-    real file, Aug 2026) -- a real, if uncommon, Sheets API hiccup, not a config problem.
-    Anything else (403 permission denied, 404 not found, ...) is NOT transient and is
-    raised immediately -- retrying it would just waste time on an error retrying can't
-    fix."""
+def _call_with_retry(fn, max_retries=6):
+    """Runs fn() with backoff on transient Google API errors (429 rate limit, or a 5xx
+    like the 503 'service currently unavailable' Mahmoud hit on a large real file, Aug
+    2026) -- a real, if uncommon, Sheets API hiccup, not a config problem. Anything else
+    (403 permission denied, 404 not found, ...) is NOT transient and is raised
+    immediately -- retrying it would just waste time on an error retrying can't fix.
+
+    Oct 2026: a 429 is Google's per-MINUTE write/read quota (60 requests per minute per
+    user), so it only clears once that minute window rolls over -- the old 1s/2s/4s/8s
+    backoff gave up after ~15 seconds, which is exactly what made a large first-time
+    upload fail part-way through. 429s now wait 20s, 40s, 60s, 60s, 60s; 5xx errors keep
+    the short backoff."""
     last_err = None
     for attempt in range(max_retries):
         try:
@@ -441,7 +450,8 @@ def _call_with_retry(fn, max_retries=4):
                 raise
             last_err = e
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s
+                wait = min(20 * (attempt + 1), 60) if status == 429 else 2 ** attempt
+                time.sleep(wait)
     raise last_err
 
 
