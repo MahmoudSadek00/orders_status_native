@@ -5,9 +5,12 @@ import datetime as dt
 import streamlit as st
 
 from cs_logic import (
-    DATA_TYPES, CS_SPREADSHEET_ID_DEFAULT, get_client, read_headers, prepare_upload,
-    read_existing_keys, dedupe_and_filter, append_new_rows,
+    DATA_TYPES, CS_SPREADSHEET_ID_DEFAULT, get_client, read_headers,
+    read_existing_keys, stream_new_rows, check_cell_capacity, append_new_rows,
 )
+
+PREVIEW_ROWS = 1000        # rows shown on screen (the full set is still added/downloadable)
+EXCEL_MAX_ROWS = 50_000    # above this the download is CSV only (Excel needs far more memory)
 
 
 def _to_excel_bytes(df):
@@ -22,9 +25,10 @@ st.caption(
     "\"Customer Support Raw Data\" sheet -- the same live sheet the CS Pulse dashboard "
     "reads from. Checks the target tab first and shows only the rows that aren't "
     "logged there yet, so re-running this on an export that overlaps a previous one "
-    "(or dragging on two overlapping files at once) never duplicates a row. Calls and "
-    "Chats are matched by their own unique ID column; Agent Activity (a state-change "
-    "log with no ID of its own) is matched by Agent + Timestamp together."
+    "(or dragging on two overlapping files at once) never duplicates a row. Calls are "
+    "matched by their ID; Chats by Contact ID + start time (the Conversation ID loses "
+    "its last digits, so two different chats can share one); Agent Activity by Agent + "
+    "Timestamp + State."
 )
 
 
@@ -122,26 +126,11 @@ if files:
 
     st.header("3. Check & add")
     if st.button(f"Check against the live \"{cfg['tab']}\" tab", type="primary"):
-        progress_bar = st.progress(0.0, text="Reading uploaded file(s)...")
-
-        def _on_progress(done, total, label):
-            frac = done / total if total else 1.0
-            progress_bar.progress(frac, text=f"Reading file {done}/{total}: {label}")
-
-        df, load_stats = prepare_upload(data_type, files, on_progress=_on_progress)
-        progress_bar.empty()
-        st.write(
-            f"{len(df)} row(s) loaded from {len(load_stats['files_read'])} file(s) "
-            f"across {len(files)} upload(s)."
-        )
-        if load_stats['files_skipped']:
-            with st.expander(f"⚠️ {len(load_stats['files_skipped'])} item(s) skipped"):
-                for nm, reason in load_stats['files_skipped']:
-                    st.write(f"- {nm}: {reason}")
-        if df.empty:
-            st.error("No readable rows found in what was uploaded.")
-            st.stop()
-
+        # Nov 2026: free the previous check's result before starting a new one.
+        for k in ('cs_new_df', 'cs_new_df_type', 'cs_dl_bytes', 'cs_dl_name'):
+            st.session_state.pop(k, None)
+        # Live keys first, then the upload is read piece by piece and only NEW rows are
+        # kept -- a 135 MB export used to be loaded whole and ran the app out of memory.
         try:
             with st.spinner(f"Reading the live \"{cfg['tab']}\" tab..."):
                 existing_keys, existing_count, existing_sample = read_existing_keys(gc, cs_spreadsheet_id, data_type)
@@ -149,13 +138,32 @@ if files:
             st.error(f"Couldn't read the sheet: {e}")
             st.stop()
 
-        new_df = dedupe_and_filter(data_type, df, existing_keys)
-        n_dupe = len(df) - len(new_df)
+        progress_bar = st.progress(0.0, text="Reading uploaded file(s)...")
 
+        def _on_progress(done, total, label):
+            frac = done / total if total else 1.0
+            progress_bar.progress(frac, text=f"Read file {done}/{total}: {label}")
+
+        with st.spinner("Reading the upload and checking each row (big files take a minute or two)..."):
+            new_df, load_stats = stream_new_rows(data_type, files, existing_keys, on_progress=_on_progress)
+        progress_bar.empty()
+        del existing_keys
+
+        if load_stats['files_skipped']:
+            with st.expander(f"⚠️ {len(load_stats['files_skipped'])} item(s) skipped"):
+                for nm, reason in load_stats['files_skipped']:
+                    st.write(f"- {nm}: {reason}")
+        rows_read = load_stats['rows_read']
+        if rows_read == 0:
+            st.error("No readable rows found in what was uploaded.")
+            st.stop()
+
+        n_dupe = rows_read - len(new_df)
         st.success(
-            f"{existing_count} row(s) already in \"{cfg['tab']}\" right now. Of the "
-            f"{len(df)} row(s) in this upload: {n_dupe} already logged (or duplicated "
-            f"within this same upload) -- skipped. **{len(new_df)} NEW row(s) to add.**"
+            f"{existing_count:,} row(s) already in \"{cfg['tab']}\" right now. Of the "
+            f"{rows_read:,} row(s) read from {len(load_stats['files_read'])} file(s): {n_dupe:,} already "
+            f"logged (or duplicated within this same upload) -- skipped. "
+            f"**{len(new_df):,} NEW row(s) to add.**"
         )
 
         with st.expander("Diagnostic -- sample of what was actually read off the sheet"):
@@ -176,21 +184,52 @@ if files:
     if new_df is not None and st.session_state.get('cs_new_df_type') == data_type:
         st.subheader(f"{len(new_df)} new row(s) ready")
         if len(new_df):
-            st.dataframe(new_df, use_container_width=True)
+            # Nov 2026: only a preview goes to the browser, and the download file is
+            # built only when asked for -- both used to cover every row on every rerun.
+            if len(new_df) > PREVIEW_ROWS:
+                st.caption(f"Showing the first {PREVIEW_ROWS:,} of {len(new_df):,} new rows.")
+            st.dataframe(new_df.head(PREVIEW_ROWS), use_container_width=True)
 
             c1, c2 = st.columns(2)
             with c1:
                 today = dt.date.today().strftime('%Y%m%d')
-                st.download_button(
-                    "Download Excel (for your own records)",
-                    data=_to_excel_bytes(new_df),
-                    file_name=f"cs_{data_type}_{today}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+                as_excel = len(new_df) <= EXCEL_MAX_ROWS
+                label = "Excel" if as_excel else "CSV"
+                if st.session_state.get('cs_dl_bytes') is None:
+                    if st.button(f"Prepare {label} download (for your own records)"):
+                        with st.spinner(f"Building the {label} file..."):
+                            if as_excel:
+                                st.session_state['cs_dl_bytes'] = _to_excel_bytes(new_df)
+                                st.session_state['cs_dl_name'] = f"cs_{data_type}_{today}.xlsx"
+                            else:
+                                st.session_state['cs_dl_bytes'] = new_df.to_csv(index=False).encode('utf-8-sig')
+                                st.session_state['cs_dl_name'] = f"cs_{data_type}_{today}.csv"
+                        st.rerun()
+                    if not as_excel:
+                        st.caption(f"More than {EXCEL_MAX_ROWS:,} rows, so the download is CSV (opens in Excel).")
+                else:
+                    name = st.session_state['cs_dl_name']
+                    st.download_button(
+                        f"Download {name}", data=st.session_state['cs_dl_bytes'], file_name=name,
+                        mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                              if name.endswith('.xlsx') else "text/csv"),
+                    )
             with c2:
                 if st.button(f"Add these {len(new_df)} row(s) to \"{cfg['tab']}\"", type="primary"):
                     try:
-                        with st.spinner(f"Appending to \"{cfg['tab']}\"..."):
+                        ok, used, needed = check_cell_capacity(gc, cs_spreadsheet_id, data_type, len(new_df))
+                    except Exception:
+                        ok, used, needed = True, 0, 0  # can't check -- don't block the add
+                    if not ok:
+                        st.error(
+                            f"Not added: Google Sheets allows 10,000,000 cells per spreadsheet. "
+                            f"This one already uses {used:,} and these rows need {needed:,} more. "
+                            f"Delete unused tabs/empty rows/columns in the sheet, or move older "
+                            f"chats to an archive spreadsheet, then try again."
+                        )
+                        st.stop()
+                    try:
+                        with st.spinner(f"Appending {len(new_df):,} rows to \"{cfg['tab']}\" (about 2 seconds per 5,000)..."):
                             n = append_new_rows(gc, cs_spreadsheet_id, data_type, new_df)
                         st.success(
                             f"{n} row(s) appended to \"{cfg['tab']}\". Re-run this check "
@@ -198,8 +237,13 @@ if files:
                             f"skipped automatically, so running it twice on the same "
                             f"export is harmless."
                         )
-                        st.session_state.pop('cs_new_df', None)
+                        for k in ('cs_new_df', 'cs_new_df_type', 'cs_dl_bytes', 'cs_dl_name'):
+                            st.session_state.pop(k, None)
                     except Exception as e:
-                        st.error(f"Couldn't append to \"{cfg['tab']}\": {e}")
+                        st.error(
+                            f"Couldn't finish appending to \"{cfg['tab']}\": {e}. Some rows "
+                            f"may already have been added. It's safe to press Check again "
+                            f"and add the rest -- rows already added are skipped."
+                        )
         else:
             st.info(f"Nothing new -- every row in this upload is already in \"{cfg['tab']}\".")
