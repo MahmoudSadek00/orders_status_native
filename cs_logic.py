@@ -39,7 +39,7 @@ import gspread
 import pandas as pd
 from gspread.utils import ValueInputOption, ValueRenderOption
 
-from logic import get_client, read_headers, read_many, clean_display, clean_key, _call_with_retry  # noqa: F401
+from logic import get_client, read_headers, read_many, iter_frames, clean_display, clean_key, _call_with_retry  # noqa: F401
 
 # Same live sheet CS Pulse (the "GC CS Performance Report" dashboard) reads from.
 CS_SPREADSHEET_ID_DEFAULT = '1Lz9OaWLpEM-m9w-5bxITTPKs9e00ZfuGtCl3m1Iicpw'
@@ -373,6 +373,70 @@ def dedupe_and_filter(data_type, df, existing_keys):
     return df[keep].reset_index(drop=True)
 
 
+def stream_new_rows(data_type, files, existing_keys, on_progress=None):
+    """Nov 2026: memory-safe replacement for prepare_upload + dedupe_and_filter on big
+    uploads (a 135 MB Chats export ran the app out of memory). Reads the upload piece by
+    piece (logic.iter_frames), de-duplicates each piece against the live sheet AND
+    everything earlier in this upload, and keeps ONLY the new rows -- the full file is
+    never held as one table. Same rules as prepare_upload/dedupe_and_filter: every cell
+    stripped, fully blank rows dropped, rows with no usable key dropped.
+
+    Returns (new_df, stats): stats has 'rows_read', 'files_read', 'files_skipped'."""
+    cfg = DATA_TYPES[data_type]
+    seen = set(existing_keys)
+    kept = []
+    rows_read = 0
+    files_read, files_skipped = [], []
+    for label, part in iter_frames(files, usecols=set(cfg['columns']), on_progress=on_progress):
+        if isinstance(part, Exception):
+            files_skipped.append((label, str(part)))
+            continue
+        if label not in files_read:
+            files_read.append(label)
+        if part.empty:
+            continue
+        part = part.fillna('')
+        for col in part.columns:
+            part[col] = part[col].astype(str).str.strip()
+        part = part[(part != '').any(axis=1)]
+        rows_read += len(part)
+        keep = []
+        for row in part.to_dict('records'):
+            k = row_key(data_type, row)
+            if k and k not in seen:
+                keep.append(True)
+                seen.add(k)
+            else:
+                keep.append(False)
+        if any(keep):
+            kept.append(part[keep])
+    new_df = (pd.concat(kept, ignore_index=True, sort=False).fillna('')
+              if kept else pd.DataFrame(columns=cfg['columns']))
+    return new_df, {'rows_read': rows_read, 'files_read': files_read, 'files_skipped': files_skipped}
+
+
+GOOGLE_SHEETS_CELL_LIMIT = 10_000_000
+
+
+def check_cell_capacity(gc, spreadsheet_id, data_type, n_new_rows):
+    """Nov 2026: Google Sheets allows at most 10 million cells per spreadsheet (all tabs
+    together, empty grid cells included). A very large append can hit that part-way
+    through and leave only some rows added. Returns (ok, used_cells, needed_cells)."""
+    cfg = DATA_TYPES[data_type]
+    sh = _call_with_retry(lambda: gc.open_by_key(spreadsheet_id))
+    meta = _call_with_retry(lambda: sh.fetch_sheet_metadata())
+    used = 0
+    tab_cols = len(cfg['columns'])
+    for sheet in meta.get('sheets', []):
+        gp = sheet.get('properties', {}).get('gridProperties', {})
+        r, c = gp.get('rowCount', 0), gp.get('columnCount', 0)
+        used += r * c
+        if sheet.get('properties', {}).get('title') == cfg['tab']:
+            tab_cols = max(c, 1)
+    needed = n_new_rows * tab_cols
+    return used + needed <= GOOGLE_SHEETS_CELL_LIMIT, used, needed
+
+
 def _chunked(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
@@ -406,16 +470,18 @@ def append_new_rows(gc, spreadsheet_id, data_type, df):
         existing_header = cfg['columns']
 
     out = df.reindex(columns=existing_header, fill_value='')
-    values = out.astype(str).values.tolist()
     # Oct 2026: 5,000 rows per call instead of 500. Google allows ~60 write requests a
     # minute, so a 120k-row first-time Chats upload at 500 rows/call needed 240 calls
     # and ran into the quota part-way. At 5,000 rows it's 24 calls (each well under
     # Google's request-size limit for this data). A short pause between calls keeps a
     # long upload under the per-minute quota; _call_with_retry still waits out any 429.
+    # Nov 2026: each 5,000-row chunk is converted to lists only when it's sent, instead
+    # of converting the whole upload up front (that doubled memory on a big upload).
     done = 0
-    for i, chunk in enumerate(_chunked(values, 5000)):
+    for i, start in enumerate(range(0, len(out), 5000)):
         if i:
             time.sleep(1.5)
+        chunk = out.iloc[start:start + 5000].astype(str).values.tolist()
         _call_with_retry(lambda chunk=chunk: ws.append_rows(chunk, value_input_option=ValueInputOption.raw))
         done += len(chunk)
     return done
