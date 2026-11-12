@@ -274,7 +274,50 @@ def _read_bytes(name: str, data: bytes, usecols=None, nrows=None) -> pd.DataFram
     buf = io.BytesIO(data)
     if name.lower().endswith('.csv'):
         return pd.read_csv(buf, dtype=str, keep_default_na=False, usecols=col_filter, nrows=nrows)
-    return pd.read_excel(buf, dtype=str, keep_default_na=False, usecols=col_filter, nrows=nrows)
+    return pd.read_excel(buf, dtype=str, keep_default_na=False, usecols=col_filter, nrows=nrows,
+                         engine=_excel_engine(name))
+
+
+def _excel_engine(name):
+    """Nov 2026: calamine (Rust) for .xlsx/.xls when it's installed -- openpyxl needs many
+    times the file's size in memory, so a 100+ MB export ran the app out of memory.
+    Falls back to pandas' default engine if python-calamine isn't installed."""
+    try:
+        import python_calamine  # noqa: F401
+        return 'calamine'
+    except ImportError:
+        return None
+
+
+def iter_frames(files, usecols=None, chunksize=20000, on_progress=None):
+    """Nov 2026: memory-safe reader for very large uploads. Yields (label, df_part)
+    pieces instead of one combined DataFrame -- a CSV is read chunksize rows at a time,
+    so the caller can de-duplicate each piece and keep only the new rows. Excel files
+    can't be streamed, so each is read whole (with calamine, see _excel_engine).
+    Every cell is a string with '' for blanks, the same as read_many. Unreadable entries
+    are yielded as (label, Exception) so the caller can report them."""
+    col_filter = (lambda c: c in usecols) if usecols else None
+    entries = list(_iter_data_entries(files))
+    total = len(entries)
+    for i, (kind, label, payload) in enumerate(entries, start=1):
+        if kind == 'skip':
+            yield label, RuntimeError(payload)
+        else:
+            base, loader = payload
+            try:
+                data = loader()
+                if base.lower().endswith('.csv'):
+                    reader = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False,
+                                         usecols=col_filter, chunksize=chunksize)
+                    for part in reader:
+                        yield label, part
+                else:
+                    yield label, _read_bytes(base, data, usecols=usecols)
+                del data
+            except Exception as e:
+                yield label, e
+        if on_progress:
+            on_progress(i, total, label)
 
 
 def _iter_data_entries(files):
@@ -792,3 +835,4 @@ def append_to_staging(gc, staging_spreadsheet_id, rows):
     values = [row_to_values(r, now_str) for r in rows]
     _call_with_retry(lambda: ws.append_rows(values))
     return len(values)
+
