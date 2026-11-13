@@ -835,4 +835,3 @@ def append_to_staging(gc, staging_spreadsheet_id, rows):
     values = [row_to_values(r, now_str) for r in rows]
     _call_with_retry(lambda: ws.append_rows(values))
     return len(values)
-
