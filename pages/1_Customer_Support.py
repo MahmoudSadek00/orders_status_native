@@ -5,8 +5,9 @@ import datetime as dt
 import streamlit as st
 
 from cs_logic import (
-    DATA_TYPES, CS_SPREADSHEET_ID_DEFAULT, get_client, read_headers,
-    read_existing_keys, stream_new_rows, check_cell_capacity, append_new_rows,
+    DATA_TYPES, CS_SPREADSHEET_ID_DEFAULT, CS_RAW_CHATS_SPREADSHEET_ID_DEFAULT, get_client,
+    read_headers, read_existing_keys, stream_new_rows, check_cell_capacity, append_new_rows,
+    target_spreadsheet_id,
 )
 
 PREVIEW_ROWS = 1000        # rows shown on screen (the full set is still added/downloadable)
@@ -21,9 +22,9 @@ def _to_excel_bytes(df):
 st.set_page_config(page_title="Customer Support", layout="wide")
 st.title("Customer Support -- Agent Activity / Chats / Calls raw data")
 st.caption(
-    "Upload a native export (Agent Activity, Chats, or Calls) and add it to the "
-    "\"Customer Support Raw Data\" sheet -- the same live sheet the CS Pulse dashboard "
-    "reads from. Checks the target tab first and shows only the rows that aren't "
+    "Upload a native export (Agent Activity, Chats, or Calls). Agent Activity and Calls "
+    "go to the \"Customer Support Raw Data\" sheet; Chats go to the separate \"CS Raw "
+    "Chats\" sheet (the CS sheet's script cleans them into CS_Chats). Checks the target tab first and shows only the rows that aren't "
     "logged there yet, so re-running this on an export that overlaps a previous one "
     "(or dragging on two overlapping files at once) never duplicates a row. Calls are "
     "matched by their ID; Chats by Contact ID + start time (the Conversation ID loses "
@@ -55,8 +56,17 @@ def _load_cs_spreadsheet_id():
         return CS_SPREADSHEET_ID_DEFAULT
 
 
+def _load_raw_chats_spreadsheet_id():
+    # Nov 2026: raw Chats live in the separate "CS Raw Chats" file (see cs_logic.py).
+    try:
+        return st.secrets.get('cs_chats_spreadsheet_id') or CS_RAW_CHATS_SPREADSHEET_ID_DEFAULT
+    except Exception:
+        return CS_RAW_CHATS_SPREADSHEET_ID_DEFAULT
+
+
 creds_info = _load_creds_info()
 cs_spreadsheet_id = _load_cs_spreadsheet_id()
+raw_chats_spreadsheet_id = _load_raw_chats_spreadsheet_id()
 
 if not creds_info or not cs_spreadsheet_id:
     st.error(
@@ -88,7 +98,25 @@ data_type = st.selectbox(
     format_func=lambda k: DATA_TYPES[k]['label'],
 )
 cfg = DATA_TYPES[data_type]
-st.caption(f"Goes into the \"{cfg['tab']}\" tab. Matched/de-duplicated by: {', '.join(cfg['key_columns'])}.")
+target_id = target_spreadsheet_id(data_type, cs_spreadsheet_id, raw_chats_spreadsheet_id)
+target_file = "CS Raw Chats" if cfg.get('spreadsheet') == 'raw_chats' else "Customer Support Raw Data"
+st.caption(
+    f"Goes into the \"{cfg['tab']}\" tab of the [{target_file}]"
+    f"(https://docs.google.com/spreadsheets/d/{target_id}/edit) sheet. "
+    f"Matched/de-duplicated by: {', '.join(cfg['key_columns'])}."
+)
+if data_type == 'chats':
+    st.caption(
+        "The CS sheet's daily script reads raw chats from this file and writes the cleaned "
+        "rows to CS_Chats, which the dashboard uses."
+    )
+    skip_old = st.checkbox(
+        "Only add chats newer than the first chat already on the tab", value=False,
+        help="Off: every missing chat in the file is added, whatever its date. "
+             "On: chats older than the tab's first chat are left out.",
+    )
+else:
+    skip_old = False
 
 st.header("2. File(s)")
 files = st.file_uploader(
@@ -133,7 +161,7 @@ if files:
         # kept -- a 135 MB export used to be loaded whole and ran the app out of memory.
         try:
             with st.spinner(f"Reading the live \"{cfg['tab']}\" tab..."):
-                existing_keys, existing_count, existing_sample = read_existing_keys(gc, cs_spreadsheet_id, data_type)
+                existing_keys, existing_count, existing_sample, earliest = read_existing_keys(gc, target_id, data_type)
         except Exception as e:
             st.error(f"Couldn't read the sheet: {e}")
             st.stop()
@@ -145,7 +173,9 @@ if files:
             progress_bar.progress(frac, text=f"Read file {done}/{total}: {label}")
 
         with st.spinner("Reading the upload and checking each row (big files take a minute or two)..."):
-            new_df, load_stats = stream_new_rows(data_type, files, existing_keys, on_progress=_on_progress)
+            min_started = earliest if skip_old else None
+            new_df, load_stats = stream_new_rows(data_type, files, existing_keys, on_progress=_on_progress,
+                                                 min_started=min_started)
         progress_bar.empty()
         del existing_keys
 
@@ -158,12 +188,14 @@ if files:
             st.error("No readable rows found in what was uploaded.")
             st.stop()
 
-        n_dupe = rows_read - len(new_df)
+        too_old = load_stats.get('too_old', 0)
+        n_dupe = rows_read - len(new_df) - too_old
         st.success(
             f"{existing_count:,} row(s) already in \"{cfg['tab']}\" right now. Of the "
             f"{rows_read:,} row(s) read from {len(load_stats['files_read'])} file(s): {n_dupe:,} already "
             f"logged (or duplicated within this same upload) -- skipped. "
-            f"**{len(new_df):,} NEW row(s) to add.**"
+            + (f"{too_old:,} started before {min_started[:10]} -- left out. " if too_old else "")
+            + f"**{len(new_df):,} NEW row(s) to add.**"
         )
 
         with st.expander("Diagnostic -- sample of what was actually read off the sheet"):
@@ -217,20 +249,17 @@ if files:
             with c2:
                 if st.button(f"Add these {len(new_df)} row(s) to \"{cfg['tab']}\"", type="primary"):
                     try:
-                        ok, used, needed = check_cell_capacity(gc, cs_spreadsheet_id, data_type, len(new_df))
+                        ok, used, needed = check_cell_capacity(gc, target_id, data_type, len(new_df))
                     except Exception:
                         ok, used, needed = True, 0, 0  # can't check -- don't block the add
                     if not ok:
-                        st.error(
-                            f"Not added: Google Sheets allows 10,000,000 cells per spreadsheet. "
-                            f"This one already uses {used:,} and these rows need {needed:,} more. "
-                            f"Delete unused tabs/empty rows/columns in the sheet, or move older "
-                            f"chats to an archive spreadsheet, then try again."
+                        st.warning(
+                            f"Heads-up: after this add the sheet will hold about {used + needed:,} "
+                            f"cells. Very large sheets get slow -- consider archiving old months."
                         )
-                        st.stop()
                     try:
                         with st.spinner(f"Appending {len(new_df):,} rows to \"{cfg['tab']}\" (about 2 seconds per 5,000)..."):
-                            n = append_new_rows(gc, cs_spreadsheet_id, data_type, new_df)
+                            n = append_new_rows(gc, target_id, data_type, new_df)
                         st.success(
                             f"{n} row(s) appended to \"{cfg['tab']}\". Re-run this check "
                             f"any time -- anything already added is recognized and "
