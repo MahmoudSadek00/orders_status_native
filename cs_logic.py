@@ -44,6 +44,13 @@ from logic import get_client, read_headers, read_many, iter_frames, clean_displa
 # Same live sheet CS Pulse (the "GC CS Performance Report" dashboard) reads from.
 CS_SPREADSHEET_ID_DEFAULT = '1Lz9OaWLpEM-m9w-5bxITTPKs9e00ZfuGtCl3m1Iicpw'
 
+# Nov 2026: since the CS sheet's script v2, raw Chats live in their own file, "CS Raw
+# Chats" (tab "Chats"). The daily script reads raw chats ONLY from there and writes the
+# cleaned rows to CS_Chats in the CS sheet -- so the app must add new chats there too.
+# Agent Activity and Calls stay in the CS sheet. Override with the
+# cs_chats_spreadsheet_id secret if the file ever moves.
+CS_RAW_CHATS_SPREADSHEET_ID_DEFAULT = '1hcx8ryJZ0S-YuoBUpy_QOgkvuiUzonzkceaZNSlyEGY'
+
 GOOGLE_SHEETS_EPOCH = dt.date(1899, 12, 30)  # same epoch cs_dashboard/logic.py uses
 
 DATA_TYPES = {
@@ -72,6 +79,7 @@ DATA_TYPES = {
     'chats': {
         'label': 'Chats',
         'tab': 'Chats',
+        'spreadsheet': 'raw_chats',   # CS Raw Chats file, not the CS sheet (see above)
         'columns': [
             'Conversation ID', 'DateTime Conversation Started',
             'DateTime Conversation Resolved', 'Contact ID', 'Assignee',
@@ -102,6 +110,13 @@ DATA_TYPES = {
         'fallback_key_column': 'Conversation ID',
     },
 }
+
+
+def target_spreadsheet_id(data_type, cs_spreadsheet_id, raw_chats_spreadsheet_id):
+    """Which spreadsheet a data type is read from / appended to."""
+    if DATA_TYPES[data_type].get('spreadsheet') == 'raw_chats':
+        return raw_chats_spreadsheet_id
+    return cs_spreadsheet_id
 
 
 def _id_key(v):
@@ -275,17 +290,20 @@ def read_existing_keys(gc, spreadsheet_id, data_type):
     Timestamp added to the key set (see _activity_ts_candidates) -- not just one -- to
     also catch a legacy row whose day/month may have been swapped by whatever process
     originally wrote it, long before this app existed. Calls/Chats have a genuine
-    unique ID so there's no such ambiguity to account for."""
+    unique ID so there's no such ambiguity to account for.
+
+    Nov 2026: also returns the earliest chat start time on the Chats tab (None for the
+    other types) -- the page uses it as the default "skip chats older than" date."""
     cfg = DATA_TYPES[data_type]
     sh = _call_with_retry(lambda: gc.open_by_key(spreadsheet_id))
     try:
         ws = _call_with_retry(lambda: sh.worksheet(cfg['tab']))
     except gspread.WorksheetNotFound:
-        return set(), 0, []
+        return set(), 0, [], None
 
     header = _call_with_retry(lambda: ws.row_values(1))
     if not header:
-        return set(), 0, []
+        return set(), 0, [], None
 
     needed = list(cfg['key_columns'])
     if cfg.get('fallback_key_column'):
@@ -309,6 +327,7 @@ def read_existing_keys(gc, spreadsheet_id, data_type):
     n_rows = max((len(v) for v in cols.values()), default=1) - 1  # minus the header cell
     keys = set()
     sample = []
+    earliest = None   # Chats only: earliest 'YYYY-MM-DD HH:MM:SS' start on the tab
     for i in range(1, n_rows + 1):
         row = {col_name: (vals[i] if i < len(vals) else None) for col_name, vals in cols.items()}
         if data_type == 'agent_activity':
@@ -323,6 +342,9 @@ def read_existing_keys(gc, spreadsheet_id, data_type):
             k = row_key(data_type, row)
             row_keys = [k] if k else []
             if data_type == 'chats':
+                st_key = _datetime_key(row.get('DateTime Conversation Started'))
+                if st_key and (earliest is None or st_key < earliest):
+                    earliest = st_key
                 # Also index the existing row by its Conversation ID, so an upload row
                 # that's missing Contact ID / start time (and falls back to the ID) can
                 # still be matched against it.
@@ -332,7 +354,7 @@ def read_existing_keys(gc, spreadsheet_id, data_type):
             keys.update(row_keys)
             if len(sample) < 3:
                 sample.append((row, row_keys))
-    return keys, max(n_rows, 0), sample
+    return keys, max(n_rows, 0), sample, earliest
 
 
 def prepare_upload(data_type, files, on_progress=None):
@@ -373,7 +395,7 @@ def dedupe_and_filter(data_type, df, existing_keys):
     return df[keep].reset_index(drop=True)
 
 
-def stream_new_rows(data_type, files, existing_keys, on_progress=None):
+def stream_new_rows(data_type, files, existing_keys, on_progress=None, min_started=None):
     """Nov 2026: memory-safe replacement for prepare_upload + dedupe_and_filter on big
     uploads (a 135 MB Chats export ran the app out of memory). Reads the upload piece by
     piece (logic.iter_frames), de-duplicates each piece against the live sheet AND
@@ -381,11 +403,16 @@ def stream_new_rows(data_type, files, existing_keys, on_progress=None):
     never held as one table. Same rules as prepare_upload/dedupe_and_filter: every cell
     stripped, fully blank rows dropped, rows with no usable key dropped.
 
-    Returns (new_df, stats): stats has 'rows_read', 'files_read', 'files_skipped'."""
+    min_started ('YYYY-MM-DD HH:MM:SS', Chats only): new chats that started before it are
+    left out and counted in stats['too_old'] -- keeps months the dashboard isn't set up
+    for (no schedules/agents) out of the raw tab.
+
+    Returns (new_df, stats): stats has 'rows_read', 'too_old', 'files_read', 'files_skipped'."""
     cfg = DATA_TYPES[data_type]
     seen = set(existing_keys)
     kept = []
     rows_read = 0
+    too_old = 0
     files_read, files_skipped = [], []
     for label, part in iter_frames(files, usecols=set(cfg['columns']), on_progress=on_progress):
         if isinstance(part, Exception):
@@ -404,6 +431,12 @@ def stream_new_rows(data_type, files, existing_keys, on_progress=None):
         for row in part.to_dict('records'):
             k = row_key(data_type, row)
             if k and k not in seen:
+                if min_started and data_type == 'chats':
+                    started = _datetime_key(row.get('DateTime Conversation Started'))
+                    if started and started < min_started:
+                        too_old += 1
+                        keep.append(False)
+                        continue
                 keep.append(True)
                 seen.add(k)
             else:
@@ -412,16 +445,20 @@ def stream_new_rows(data_type, files, existing_keys, on_progress=None):
             kept.append(part[keep])
     new_df = (pd.concat(kept, ignore_index=True, sort=False).fillna('')
               if kept else pd.DataFrame(columns=cfg['columns']))
-    return new_df, {'rows_read': rows_read, 'files_read': files_read, 'files_skipped': files_skipped}
+    return new_df, {'rows_read': rows_read, 'too_old': too_old, 'files_read': files_read,
+                    'files_skipped': files_skipped}
 
 
-GOOGLE_SHEETS_CELL_LIMIT = 10_000_000
+# Nov 2026: Google's documented limit used to be 10M cells per spreadsheet, but the live
+# CS sheet already holds 12.9M, so it isn't a hard stop any more. Above this the page only
+# WARNS (a big sheet gets slow); if Google ever refuses an append part-way, re-running the
+# check and add is safe -- rows already added are skipped.
+GOOGLE_SHEETS_CELL_WARN = 10_000_000
 
 
 def check_cell_capacity(gc, spreadsheet_id, data_type, n_new_rows):
-    """Nov 2026: Google Sheets allows at most 10 million cells per spreadsheet (all tabs
-    together, empty grid cells included). A very large append can hit that part-way
-    through and leave only some rows added. Returns (ok, used_cells, needed_cells)."""
+    """Cells the whole spreadsheet uses (all tabs, empty grid cells included) and the
+    cells these new rows will add. Returns (under_warn_level, used_cells, needed_cells)."""
     cfg = DATA_TYPES[data_type]
     sh = _call_with_retry(lambda: gc.open_by_key(spreadsheet_id))
     meta = _call_with_retry(lambda: sh.fetch_sheet_metadata())
@@ -434,7 +471,7 @@ def check_cell_capacity(gc, spreadsheet_id, data_type, n_new_rows):
         if sheet.get('properties', {}).get('title') == cfg['tab']:
             tab_cols = max(c, 1)
     needed = n_new_rows * tab_cols
-    return used + needed <= GOOGLE_SHEETS_CELL_LIMIT, used, needed
+    return used + needed <= GOOGLE_SHEETS_CELL_WARN, used, needed
 
 
 def _chunked(seq, size):
